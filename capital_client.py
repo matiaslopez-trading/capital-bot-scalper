@@ -15,7 +15,7 @@ BASE_URL = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540  # 9 minutos
 
 API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
-API_PASS   = os.environ.get("CAPITAL_PASS", "")
+API_PASS   = os.environ.get("CAPITAL_PASSWORD", "")
 API_EMAIL  = os.environ.get("CAPITAL_EMAIL", "")
 
 # Epics de Capital.com para cada simbolo
