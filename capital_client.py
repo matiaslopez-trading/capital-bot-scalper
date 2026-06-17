@@ -102,12 +102,13 @@ class CapitalClient:
     def get_activity_history(self, days=90):
         """Retorna historial de posiciones cerradas con P&L."""
         self.ensure_session()
+        import calendar
         now     = datetime.utcnow()
-        from_dt = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        to_dt   = now.strftime("%Y-%m-%dT%H:%M:%S")
+        from_ms = int(calendar.timegm((now - timedelta(days=days)).timetuple()) * 1000)
+        to_ms   = int(calendar.timegm(now.timetuple()) * 1000)
         params  = {
-            "from":     from_dt,
-            "to":       to_dt,
+            "from":     from_ms,
+            "to":       to_ms,
             "pageSize": 500,
         }
         url  = f"{BASE_URL}/api/v1/history/activity"
