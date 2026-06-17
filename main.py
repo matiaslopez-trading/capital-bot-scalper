@@ -146,6 +146,14 @@ def start_scheduler():
     logger.info("[main] Scheduler activo — ciclo cada 5 minutos.")
 
 
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return response
+
+
 @app.route("/", methods=["GET"])
 def health():
     with scanner_lock:
@@ -177,6 +185,28 @@ def scan_now():
         pos_copy = dict(own_positions)
     return jsonify({"last_scan": last_scan_time, "signals": state_copy,
                     "errors": scan_errors, "own_positions": pos_copy}), 200
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    """Endpoint para el dashboard — retorna posiciones, cuenta e historial."""
+    try:
+        positions  = client.get_positions()
+        accounts   = client.get_accounts()
+        activities = client.get_activity_history(days=90)
+        with own_positions_lock:
+            pos_copy = dict(own_positions)
+        return jsonify({
+            "bot":           "Bot Scalper v1",
+            "own_positions": pos_copy,
+            "positions":     positions,
+            "accounts":      accounts,
+            "activities":    activities,
+            "last_scan":     last_scan_time,
+        }), 200
+    except Exception as e:
+        logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/webhook", methods=["POST"])
