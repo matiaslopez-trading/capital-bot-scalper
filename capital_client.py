@@ -8,6 +8,7 @@ import os
 import time
 import logging
 import requests
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,32 @@ class CapitalClient:
         resp = requests.get(url, headers=self._headers(), timeout=15)
         resp.raise_for_status()
         return resp.json().get("positions", [])
+
+    def get_accounts(self):
+        """Retorna info de la cuenta (balance, equity, P&L del dia)."""
+        self.ensure_session()
+        url  = f"{BASE_URL}/api/v1/accounts"
+        resp = requests.get(url, headers=self._headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("accounts", [])
+
+    def get_activity_history(self, days=90):
+        """Retorna historial de posiciones cerradas con P&L."""
+        self.ensure_session()
+        now     = datetime.utcnow()
+        from_dt = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        to_dt   = now.strftime("%Y-%m-%dT%H:%M:%S")
+        params  = {
+            "from":     from_dt,
+            "to":       to_dt,
+            "type":     "POSITION",
+            "pageSize": 500,
+            "detailed": "true",
+        }
+        url  = f"{BASE_URL}/api/v1/history/activity"
+        resp = requests.get(url, headers=self._headers(), params=params, timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("activities", [])
 
     def open_position(self, symbol, action, entry, sl, tp1):
         epic = SYMBOL_MAP.get(symbol)
