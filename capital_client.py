@@ -108,14 +108,13 @@ class CapitalClient:
         params  = {
             "from":     from_dt,
             "to":       to_dt,
-            "type":     "POSITION",
             "pageSize": 500,
-            "detailed": "true",
         }
         url  = f"{BASE_URL}/api/v1/history/activity"
         resp = requests.get(url, headers=self._headers(), params=params, timeout=15)
         resp.raise_for_status()
-        return resp.json().get("activities", [])
+        data = resp.json()
+        return data.get("activities", [])
 
     def open_position(self, symbol, action, entry, sl, tp1):
         epic = SYMBOL_MAP.get(symbol)
