@@ -49,6 +49,9 @@ MIN_SIZE = {
 
 class CapitalClient:
     def __init__(self):
+        self.api_key    = os.environ["CAPITAL_API_KEY"]
+        self.password   = os.environ["CAPITAL_PASSWORD"]
+        self.email      = os.environ["CAPITAL_EMAIL"]
         self.cst        = None
         self.security   = None
         self.session_ts = 0
@@ -62,8 +65,12 @@ class CapitalClient:
 
     def login(self):
         url  = f"{BASE_URL}/api/v1/session"
-        body = {"identifier": API_EMAIL, "password": API_PASS}
-        hdrs = {"X-CAP-API-KEY": API_KEY, "Content-Type": "application/json"}
+        body = {
+            "identifier":        self.email,
+            "password":          self.password,
+            "encryptedPassword": False,
+        }
+        hdrs = {"X-CAP-API-KEY": self.api_key, "Content-Type": "application/json"}
         resp = requests.post(url, json=body, headers=hdrs, timeout=15)
         resp.raise_for_status()
         self.cst        = resp.headers.get("CST")
