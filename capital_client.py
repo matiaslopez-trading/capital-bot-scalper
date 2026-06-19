@@ -1,7 +1,6 @@
 """
-capital_client.py — Bot Scalper
-Wrapper para la API REST de Capital.com (demo).
-Igual al Bot Swing pero con MIN_SIZE calibrado para scalping.
+capital_client.py
+Cliente para la API REST de Capital.com (modo demo).
 """
 
 import os
@@ -12,38 +11,38 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://demo-api-capital.backend-capital.com"
-SESSION_TTL = 540  # 9 minutos
-
-API_KEY    = os.environ.get("CAPITAL_API_KEY", "")
-API_PASS   = os.environ.get("CAPITAL_PASSWORD", "")
-API_EMAIL  = os.environ.get("CAPITAL_EMAIL", "")
+BASE_URL    = "https://demo-api-capital.backend-capital.com"
+SESSION_TTL = 540
 
 SYMBOL_MAP = {
-    "BTCUSD":  "BITCOIN",
-    "ETHUSD":  "ETHEREUM",
-    "NVDA":    "NVDA",
-    "NDAQ":    "NDAQ",
-    "SILVER":  "SILVER",
-    "GBPUSD":  "GBPUSD",
-    "GOLD":    "GOLD",
-    "USOIL":   "OIL_CRUDE",
-    "EURUSD":  "EURUSD",
-    "US500":   "US500",
+    "BTCUSD":   "BITCOIN",
+    "ETHUSD":   "ETHEREUM",
+    "NVDA":     "NVDA",
+    "NDAQ":     "NDAQ",
+    "SILVER":   "SILVER",
+    "GBPUSD":   "GBPUSD",
+    "GOLD":     "GOLD",
+    "USOIL":    "OIL_CRUDE",
+    "EURUSD":   "EURUSD",
+    "US500":    "US500",
 }
 
 MIN_SIZE = {
-    "BITCOIN":   0.01,
-    "ETHEREUM":  0.1,
-    "NVDA":      1.0,
-    "NDAQ":      1.0,
-    "SILVER":    1.0,
-    "GBPUSD":    1000.0,
-    "GOLD":      0.1,
-    "OIL_CRUDE": 1.0,
-    "EURUSD":    1000.0,
-    "US500":     0.1,
+    "BITCOIN":    0.01,
+    "ETHEREUM":   0.1,
+    "NVDA":       1.0,
+    "NDAQ":       1.0,
+    "SILVER":     1.0,
+    "GBPUSD":     1000.0,
+    "GOLD":       0.1,
+    "OIL_CRUDE":  1.0,
+    "EURUSD":     1000.0,
+    "US500":      0.1,
 }
+
+# Sizing dinamico: score mas alto = posicion mas grande
+# Score 2 = minimo, Score 6 = 3x el minimo
+SCORE_SIZE = {2: 1.0, 3: 1.5, 4: 2.0, 5: 2.5, 6: 3.0}
 
 class CapitalClient:
     def __init__(self):
@@ -117,7 +116,7 @@ class CapitalClient:
                 break
         return all_activities
 
-    def open_position(self, symbol, action, entry, sl, tp1):
+    def open_position(self, symbol, action, entry, sl, tp1, score=2):
         epic = SYMBOL_MAP.get(symbol)
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
@@ -127,8 +126,10 @@ class CapitalClient:
             if p.get("market", {}).get("epic") == epic:
                 logger.info(f"[client] {symbol}: ya tiene posicion abierta, omitiendo")
                 return None
-        direction = "BUY" if action == "LONG" else "SELL"
-        size      = MIN_SIZE.get(epic, 1.0)
+        direction  = "BUY" if action == "LONG" else "SELL"
+        base_size  = MIN_SIZE.get(epic, 1.0)
+        multiplier = SCORE_SIZE.get(min(abs(score), 6), 1.0)
+        size       = round(base_size * multiplier, 4)
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
         body = {
@@ -136,13 +137,13 @@ class CapitalClient:
             "direction":      direction,
             "size":           size,
             "guaranteedStop": False,
-            "stopLevel":      sl,
-            "profitLevel":    tp1,
+            "stopLevel":      round(sl, 5),
+            "profitLevel":    round(tp1, 5),
         }
         resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[client] {symbol}: {direction} size={size} sl={sl} tp={tp1} — {data}")
+        logger.info(f"[client] {symbol}: {direction} size={size} (score={score}, x{multiplier}) sl={sl} tp={tp1} - {data}")
         return data
 
     def close_position(self, deal_id):
