@@ -1,6 +1,6 @@
 """
 capital_client.py
-Cliente para la API REST de Capital.com (modo demo).
+Cliente para la API REST de Capital.com (modo demo) — Bot Scalper.
 """
 
 import os
@@ -27,65 +27,61 @@ SYMBOL_MAP = {
     "US500":    "US500",
 }
 
+# % del capital total a arriesgar segun nivel de score
+PCT_POR_SCORE = {2: 0.02, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
+
+# Tamanio minimo permitido por Capital.com (floor de seguridad)
 MIN_SIZE = {
-    "BITCOIN":    0.01,
-    "ETHEREUM":   0.1,
-    "NVDA":       1.0,
-    "NDAQ":       1.0,
-    "SILVER":     1.0,
-    "GBPUSD":     1000.0,
-    "GOLD":       0.1,
-    "OIL_CRUDE":  1.0,
-    "EURUSD":     1000.0,
-    "US500":      0.1,
+    "BITCOIN":   0.01,
+    "ETHEREUM":  0.1,
+    "NVDA":      1.0,
+    "NDAQ":      1.0,
+    "SILVER":    1.0,
+    "GBPUSD":    1000.0,
+    "GOLD":      0.1,
+    "OIL_CRUDE": 1.0,
+    "EURUSD":    1000.0,
+    "US500":     0.1,
 }
 
-# Sizing dinamico: score mas alto = posicion mas grande
-# Score 2 = minimo, Score 6 = 3x el minimo
-SCORE_SIZE = {2: 1.0, 3: 1.5, 4: 2.0, 5: 2.5, 6: 3.0}
 
 class CapitalClient:
     def __init__(self):
         self.api_key    = os.environ["CAPITAL_API_KEY"]
         self.password   = os.environ["CAPITAL_PASSWORD"]
-        self.email      = os.environ["CAPITAL_EMAIL"]
+        self.identifier = os.environ["CAPITAL_IDENTIFIER"]
         self.cst        = None
-        self.security   = None
+        self.x_token    = None
         self.session_ts = 0
 
     def _headers(self):
         return {
-            "CST":              self.cst,
-            "X-SECURITY-TOKEN": self.security,
+            "X-SECURITY-TOKEN": self.x_token or "",
+            "CST":              self.cst or "",
             "Content-Type":     "application/json",
         }
+
+    def ensure_session(self):
+        if time.time() - self.session_ts > SESSION_TTL:
+            self.login()
 
     def login(self):
         url  = f"{BASE_URL}/api/v1/session"
         body = {
-            "identifier":        self.email,
+            "identifier":        self.identifier,
             "password":          self.password,
             "encryptedPassword": False,
         }
-        hdrs = {"X-CAP-API-KEY": self.api_key, "Content-Type": "application/json"}
-        resp = requests.post(url, json=body, headers=hdrs, timeout=15)
+        resp = requests.post(
+            url, json=body,
+            headers={"X-CAP-API-KEY": self.api_key},
+            timeout=15
+        )
         resp.raise_for_status()
         self.cst        = resp.headers.get("CST")
-        self.security   = resp.headers.get("X-SECURITY-TOKEN")
+        self.x_token    = resp.headers.get("X-SECURITY-TOKEN")
         self.session_ts = time.time()
         logger.info("[client] Login OK")
-
-    def ensure_session(self):
-        if time.time() - self.session_ts > SESSION_TTL:
-            logger.info("[client] Sesion expirada, re-login...")
-            self.login()
-
-    def get_positions(self):
-        self.ensure_session()
-        url  = f"{BASE_URL}/api/v1/positions"
-        resp = requests.get(url, headers=self._headers(), timeout=15)
-        resp.raise_for_status()
-        return resp.json().get("positions", [])
 
     def get_accounts(self):
         self.ensure_session()
@@ -94,26 +90,45 @@ class CapitalClient:
         resp.raise_for_status()
         return resp.json().get("accounts", [])
 
-    def get_activity_history(self, days=30):
-        """Capital.com max range = 1 day; loop dia por dia."""
-        import calendar
+    def get_balance(self):
+        """Retorna el balance disponible de la cuenta demo."""
+        try:
+            accounts = self.get_accounts()
+            for acc in accounts:
+                balance = acc.get("balance", {}).get("available", 0)
+                if balance > 0:
+                    return float(balance)
+        except Exception as e:
+            logger.warning(f"[client] No se pudo obtener balance: {e}")
+        return 1000.0  # fallback conservador
+
+    def get_positions(self):
+        self.ensure_session()
+        url  = f"{BASE_URL}/api/v1/positions"
+        resp = requests.get(url, headers=self._headers(), timeout=15)
+        resp.raise_for_status()
+        return resp.json().get("positions", [])
+
+    def get_activity_history(self, days=7):
         self.ensure_session()
         all_activities = []
         now = datetime.utcnow()
-        for i in range(days):
-            day_end   = now - timedelta(days=i)
-            day_start = day_end - timedelta(days=1)
-            end_ms    = int(calendar.timegm(day_end.timetuple()) * 1000)
-            start_ms  = int(calendar.timegm(day_start.timetuple()) * 1000)
-            params = {"from": start_ms, "to": end_ms, "pageSize": 500}
-            url = f"{BASE_URL}/api/v1/history/activity"
+        for day in range(days):
+            date_to   = now - timedelta(days=day)
+            date_from = date_to - timedelta(days=1)
+            from_ms   = int(date_from.timestamp() * 1000)
+            to_ms     = int(date_to.timestamp() * 1000)
+            url = (
+                f"{BASE_URL}/api/v1/history/activity"
+                f"?from={from_ms}&to={to_ms}&pageSize=500"
+            )
             try:
-                resp = requests.get(url, headers=self._headers(), params=params, timeout=15)
+                resp = requests.get(url, headers=self._headers(), timeout=15)
                 resp.raise_for_status()
-                all_activities.extend(resp.json().get("activities", []))
+                data = resp.json().get("activities", [])
+                all_activities.extend(data)
             except Exception as e:
-                logger.warning(f"[client] activity day -{i}: {e}")
-                break
+                logger.warning(f"[client] activity day -{day}: {e}")
         return all_activities
 
     def open_position(self, symbol, action, entry, sl, tp1, score=2):
@@ -126,10 +141,13 @@ class CapitalClient:
             if p.get("market", {}).get("epic") == epic:
                 logger.info(f"[client] {symbol}: ya tiene posicion abierta, omitiendo")
                 return None
-        direction  = "BUY" if action == "LONG" else "SELL"
-        base_size  = MIN_SIZE.get(epic, 1.0)
-        multiplier = SCORE_SIZE.get(min(abs(score), 6), 1.0)
-        size       = round(base_size * multiplier, 4)
+        direction = "BUY" if action == "LONG" else "SELL"
+        # Sizing dinamico: % del capital segun score
+        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02)
+        balance  = self.get_balance()
+        risk_usd = balance * pct
+        size     = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
+        size     = max(size, MIN_SIZE.get(epic, 1.0))  # floor minimo Capital.com
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
         body = {
@@ -137,13 +155,16 @@ class CapitalClient:
             "direction":      direction,
             "size":           size,
             "guaranteedStop": False,
-            "stopLevel":      round(sl, 5),
-            "profitLevel":    round(tp1, 5),
+            "stopLevel":      round(sl, 4),
+            "profitLevel":    round(tp1, 4),
         }
         resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"[client] {symbol}: {direction} size={size} (score={score}, x{multiplier}) sl={sl} tp={tp1} - {data}")
+        logger.info(
+            f"[client] {symbol}: {direction} size={size} "
+            f"({pct*100:.0f}% de balance={balance:.0f}) score={score} sl={sl} tp={tp1} - {data}"
+        )
         return data
 
     def close_position(self, deal_id):
