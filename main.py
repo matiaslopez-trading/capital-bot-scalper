@@ -111,7 +111,7 @@ def run_cycle():
                 sl    = res.get("sl", 0)
                 tp1   = res.get("tp1", 0)
                 if entry and sl and tp1:
-                    deal = client.open_position(symbol=sym, action=signal, entry=entry, sl=sl, tp1=tp1)
+                    deal = client.open_position(symbol=sym, action=signal, entry=entry, sl=sl, tp1=tp1, score=score)
                     if deal:
                         deal_id = (
                             deal.get("dealId") or
