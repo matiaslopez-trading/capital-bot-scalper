@@ -1,6 +1,6 @@
 """
 capital_client.py
-Cliente para la API REST de Capital.com (modo demo) — Bot Scalper.
+Cliente para la API REST de Capital.com (modo demo) — Bot Scalper v3.
 """
 
 import os
@@ -9,40 +9,36 @@ import logging
 import requests
 from datetime import datetime, timedelta
 
-# fix: force clean rebuild
 logger = logging.getLogger(__name__)
 
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540
 
+# Activos v3: alta volatilidad, distintos al Bot Swing
 SYMBOL_MAP = {
-    "BTCUSD":   "BITCOIN",
-    "ETHUSD":   "ETHEREUM",
-    "NVDA":     "NVDA",
-    "NDAQ":     "NDAQ",
-    "SILVER":   "SILVER",
-    "GBPUSD":   "GBPUSD",
-    "GOLD":     "GOLD",
-    "USOIL":    "OIL_CRUDE",
-    "EURUSD":   "EURUSD",
-    "US500":    "US500",
+    "US100":   "US100",
+    "GBPJPY":  "GBPJPY",
+    "DOGEUSD": "DOGEUSD",
+    "XRPUSD":  "XRPUSD",
+    "SOLUSD":  "SOLUSD",
+    "AMZN":    "AMZN",
+    "TSLA":    "TSLA",
+    "AAPL":    "AAPL",
+    "MSFT":    "MSFT",
 }
 
-# % del capital total a arriesgar segun nivel de score
 PCT_POR_SCORE = {2: 0.02, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
-# Tamanio minimo permitido por Capital.com (floor de seguridad)
 MIN_SIZE = {
-    "BITCOIN":   0.01,
-    "ETHEREUM":  0.1,
-    "NVDA":      1.0,
-    "NDAQ":      1.0,
-    "SILVER":    1.0,
-    "GBPUSD":    1000.0,
-    "GOLD":      0.1,
-    "OIL_CRUDE": 1.0,
-    "EURUSD":    1000.0,
-    "US500":     0.1,
+    "US100":   0.1,
+    "GBPJPY":  1000.0,
+    "DOGEUSD": 1000.0,
+    "XRPUSD":  100.0,
+    "SOLUSD":  1.0,
+    "AMZN":    1.0,
+    "TSLA":    1.0,
+    "AAPL":    1.0,
+    "MSFT":    1.0,
 }
 
 
@@ -92,7 +88,6 @@ class CapitalClient:
         return resp.json().get("accounts", [])
 
     def get_balance(self):
-        """Retorna el balance disponible de la cuenta demo."""
         try:
             accounts = self.get_accounts()
             for acc in accounts:
@@ -101,7 +96,7 @@ class CapitalClient:
                     return float(balance)
         except Exception as e:
             logger.warning(f"[client] No se pudo obtener balance: {e}")
-        return 1000.0  # fallback conservador
+        return 1000.0
 
     def get_positions(self):
         self.ensure_session()
@@ -132,23 +127,25 @@ class CapitalClient:
                 logger.warning(f"[client] activity day -{day}: {e}")
         return all_activities
 
-    def open_position(self, symbol, action, entry, sl, tp1, score=2):
+    def open_position(self, symbol, action, entry, sl, tp1, score=2, sizing_mult=1.0):
         epic = SYMBOL_MAP.get(symbol)
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
             return None
-        positions = self.get_positions()
-        for p in positions:
-            if p.get("market", {}).get("epic") == epic:
-                logger.info(f"[client] {symbol}: ya tiene posicion abierta, omitiendo")
-                return None
+        try:
+            positions = self.get_positions()
+            for p in positions:
+                if p.get("market", {}).get("epic") == epic:
+                    logger.info(f"[client] {symbol}: ya tiene posicion abierta, omitiendo")
+                    return None
+        except Exception as e:
+            logger.warning(f"[client] {symbol}: no se pudo verificar posiciones: {e}")
         direction = "BUY" if action == "LONG" else "SELL"
-        # Sizing dinamico: % del capital segun score
-        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02)
+        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02) * sizing_mult
         balance  = self.get_balance()
         risk_usd = balance * pct
         size     = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        size     = max(size, MIN_SIZE.get(epic, 1.0))  # floor minimo Capital.com
+        size     = max(size, MIN_SIZE.get(epic, 1.0))
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
         body = {
@@ -159,12 +156,25 @@ class CapitalClient:
             "stopLevel":      round(sl, 4),
             "profitLevel":    round(tp1, 4),
         }
-        resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
-        resp.raise_for_status()
+        try:
+            resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
+            resp.raise_for_status()
+        except requests.HTTPError:
+            if resp.status_code == 400:
+                try:
+                    detail = resp.json()
+                except Exception:
+                    detail = resp.text
+                logger.warning(
+                    f"[client] {symbol}: posicion rechazada (400) — "
+                    f"posiblemente mercado cerrado: {detail}"
+                )
+                return None
+            raise
         data = resp.json()
         logger.info(
             f"[client] {symbol}: {direction} size={size} "
-            f"({pct*100:.0f}% de balance={balance:.0f}) score={score} sl={sl} tp={tp1} - {data}"
+            f"({pct*100:.1f}% balance={balance:.0f}) score={score} sl={sl} tp={tp1} - {data}"
         )
         return data
 
