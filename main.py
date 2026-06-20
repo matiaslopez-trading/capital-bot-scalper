@@ -1,12 +1,14 @@
 """
-main.py — Bot Scalper v2
+main.py — Bot Scalper v3
 Flask + APScheduler. Ciclo cada 5 minutos.
-10 activos en 15min con bias de 4H.
+9 activos nuevos de alta volatilidad en 15min con bias de 4H.
 
-Mejoras v2:
-- Cooldown tracking: 30 min bloqueado por activo tras SL
-- open_positions pasado al scanner (correlaciones)
-- Version bumped a v2
+Cambios v3 vs v2:
+- Nuevos 9 activos (US100, GBPJPY, DOGEUSD, XRPUSD, SOLUSD, AMZN, TSLA, AAPL, MSFT)
+- Regimen de mercado (ALCISTA/BAJISTA/LATERAL) via regime_detector.py
+- sizing_mult por regimen pasado a client.open_position
+- Fix: client.security -> client.x_token
+- START_TRADING_UTC: no abre posiciones antes del lunes 2026-06-23 15:00 UTC
 """
 
 import os
@@ -20,8 +22,9 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from capital_client import CapitalClient
 from apscheduler.schedulers.background import BackgroundScheduler
-from data_feed import get_all_ohlcv
+from data_feed import get_all_ohlcv, CAPITAL_EPICS
 from scanner import run_scanner, COOLDOWN_VELAS
+import regime_detector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +36,10 @@ app = Flask(__name__)
 client = CapitalClient()
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+# No abrir posiciones nuevas antes de esta fecha/hora
+# Protege posiciones pre-v3 que Matias cierra manualmente
+START_TRADING_UTC = datetime(2026, 6, 23, 15, 0, 0, tzinfo=timezone.utc)
 
 scanner_state  = {}
 scanner_lock   = threading.Lock()
@@ -47,22 +54,47 @@ cooldown_until_lock = threading.Lock()
 
 COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 15)
 
+# Regimenes por activo — se actualiza una vez por dia
+current_regimes      = {}
+current_regimes_lock = threading.Lock()
+last_regime_update   = None
+
 
 def _now_utc():
     return datetime.now(timezone.utc)
+
+
+def _update_regimes_if_needed():
+    """Actualiza regimenes de mercado una vez por dia."""
+    global last_regime_update
+    today = _now_utc().strftime("%Y-%m-%d")
+    if last_regime_update == today:
+        return
+    try:
+        regimes = regime_detector.fetch_and_update(client, CAPITAL_EPICS)
+        with current_regimes_lock:
+            current_regimes.clear()
+            current_regimes.update(regimes)
+        last_regime_update = today
+        logger.info(f"[main] Regimenes actualizados: {regimes}")
+    except Exception as e:
+        logger.warning(f"[main] No se pudo actualizar regimenes: {e}")
 
 
 def run_cycle():
     global last_scan_time
 
     try:
-        if not client.cst or not client.security:
+        if not client.cst or not client.x_token:
             logger.info("[main] Re-login necesario...")
             client.login()
             time.sleep(2)
     except Exception as e:
         logger.error(f"[main] Error en login: {e}")
         return
+
+    # Actualizar regimenes una vez al dia
+    _update_regimes_if_needed()
 
     try:
         data_15m, data_4h = get_all_ohlcv(client)
@@ -75,17 +107,20 @@ def run_cycle():
         logger.warning("[main] CICLO ABORTADO - sin datos validos. Posiciones protegidas.")
         return
 
-    logger.info(f"[main] Datos 15m validos: {len(valid_syms)}/10 activos")
+    logger.info(f"[main] Datos 15m validos: {len(valid_syms)}/9 activos")
 
     with own_positions_lock:
         open_pos_set = set(own_positions.keys())
     with cooldown_until_lock:
         cd_snapshot = dict(cooldown_until)
+    with current_regimes_lock:
+        regimes_snapshot = dict(current_regimes)
 
     try:
         results = run_scanner(data_15m, data_4h,
                               open_positions=open_pos_set,
-                              cooldown_until=cd_snapshot)
+                              cooldown_until=cd_snapshot,
+                              regimes=regimes_snapshot)
     except Exception as e:
         logger.error(f"[main] Error en scanner: {e}")
         return
@@ -94,6 +129,15 @@ def run_cycle():
         scanner_state.clear()
         scanner_state.update(results)
         last_scan_time = datetime.utcnow().isoformat() + "Z"
+
+    now = _now_utc()
+    trading_habilitado = now >= START_TRADING_UTC
+    if not trading_habilitado:
+        remaining = int((START_TRADING_UTC - now).total_seconds() / 3600)
+        logger.info(
+            f"[main] START_TRADING_UTC no alcanzado — no se abren posiciones nuevas "
+            f"({remaining}h restantes)"
+        )
 
     for sym, res in results.items():
         if sym not in valid_syms:
@@ -120,6 +164,9 @@ def run_cycle():
                     logger.debug(f"[main] {sym}: ESPERAR - sin posicion propia")
 
             elif signal in ("LONG", "SHORT"):
+                if not trading_habilitado:
+                    continue
+
                 with own_positions_lock:
                     if sym in own_positions:
                         logger.info(f"[main] {sym}: {signal} - posicion propia ya abierta")
@@ -129,9 +176,12 @@ def run_cycle():
                 sl    = res.get("sl", 0)
                 tp1   = res.get("tp1", 0)
                 if entry and sl and tp1:
+                    # Sizing ajustado por regimen
+                    sizing_mult = regime_detector.get_params(sym).get("sizing_mult", 1.0)
                     deal = client.open_position(
                         symbol=sym, action=signal,
-                        entry=entry, sl=sl, tp1=tp1, score=score
+                        entry=entry, sl=sl, tp1=tp1,
+                        score=score, sizing_mult=sizing_mult
                     )
                     if deal is None:
                         continue
@@ -147,7 +197,8 @@ def run_cycle():
                             logger.info(
                                 f"[main] {sym}: {signal} @ {entry} "
                                 f"SL={sl} TP={tp1} ATR={res.get('atr','?')} "
-                                f"score={score} deal={deal_id}"
+                                f"score={score} regime={res.get('regime','?')} "
+                                f"sizing_mult={sizing_mult} deal={deal_id}"
                             )
                         else:
                             logger.warning(f"[main] {sym}: posicion abierta sin dealId: {deal}")
@@ -159,7 +210,7 @@ def run_cycle():
                     own_positions.pop(sym, None)
                 with cooldown_until_lock:
                     cooldown_until[sym] = _now_utc() + COOLDOWN_DURATION
-                logger.info(f"[main] {sym}: SL detectado - cooldown activado")
+                logger.info(f"[main] {sym}: SL dtectado - cooldown activado")
             scan_errors[sym] = str(e)
             logger.error(f"[main] {sym}: {e}\n{traceback.format_exc()}")
 
@@ -204,14 +255,20 @@ def health():
         pos_copy = dict(own_positions)
     with cooldown_until_lock:
         cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
+    with current_regimes_lock:
+        reg_copy = dict(current_regimes)
+    now = _now_utc()
     return jsonify({
-        "status":         "ok",
-        "bot":            "Bot Scalper v2",
-        "activos":        10,
-        "last_scan":      last_scan_time,
-        "signals":        n,
-        "own_positions":  pos_copy,
-        "cooldowns":      cd_copy,
+        "status":               "ok",
+        "bot":                  "Bot Scalper v3",
+        "activos":              9,
+        "last_scan":            last_scan_time,
+        "signals":              n,
+        "own_positions":        pos_copy,
+        "cooldowns":            cd_copy,
+        "regimes":              reg_copy,
+        "trading_habilitado":   now >= START_TRADING_UTC,
+        "start_trading_utc":    START_TRADING_UTC.isoformat(),
     }), 200
 
 
@@ -223,12 +280,15 @@ def signals():
         pos_copy = dict(own_positions)
     with cooldown_until_lock:
         cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
+    with current_regimes_lock:
+        reg_copy = dict(current_regimes)
     return jsonify({
         "last_scan":     last_scan_time,
         "signals":       state_copy,
         "errors":        scan_errors,
         "own_positions": pos_copy,
         "cooldowns":     cd_copy,
+        "regimes":       reg_copy,
     }), 200
 
 
@@ -257,13 +317,16 @@ def stats():
         activities = client.get_activity_history(days=90)
         with own_positions_lock:
             pos_copy = dict(own_positions)
+        with current_regimes_lock:
+            reg_copy = dict(current_regimes)
         return jsonify({
-            "bot":           "Bot Scalper v2",
+            "bot":           "Bot Scalper v3",
             "own_positions": pos_copy,
             "positions":     positions,
             "accounts":      accounts,
             "activities":    activities,
             "last_scan":     last_scan_time,
+            "regimes":       reg_copy,
         }), 200
     except Exception as e:
         logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
