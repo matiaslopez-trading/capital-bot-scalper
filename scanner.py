@@ -1,15 +1,10 @@
 """
-scanner.py — Bot Scalper v2
-Mejoras vs v1:
-- SL dinamico 1.5xATR(7) — elimina el SL fijo 0.7% critico
-- TP dinamico 3xATR(7) — mantiene R:R ~2:1 adaptado a cada activo
-- RSI periodo 7->9, Wilder smoothing (igual que el Swing)
-- MACD eliminado — redundante con EMA9/21, generaba ruido
-- ATR ahora activo (antes era indicador muerto)
-- UMBRAL 2->3 — requiere confluencia real
-- Bias 4H: filtro duro (antes era blando con excepcion score>=3)
-- Cooldown 2 velas (30 min) por activo despues de SL
-- Correlaciones: max 1 posicion por grupo
+scanner.py — Bot Scalper v3
+Misma estructura que v2. Cambios vs v2:
+- CORRELATION_GROUPS actualizado para los 9 activos nuevos
+- _score_symbol acepta regime=None (regimen de mercado por activo)
+- run_scanner acepta regimes=None dict { sym: "ALCISTA"|"BAJISTA"|"LATERAL" }
+- El resultado incluye "regime" y "umbral_extra" para que main.py ajuste sizing
 """
 
 import logging
@@ -30,12 +25,11 @@ ATR_MULT_TP  = 3.0
 UMBRAL       = 3
 COOLDOWN_VELAS = 2
 
-GOLD_SYMS = {"GOLD", "SILVER"}
-
+# Activos v3 — alta volatilidad
 CORRELATION_GROUPS = [
-    {"GOLD", "SILVER"},
-    {"BTCUSD", "ETHUSD"},
-    {"NVDA", "NDAQ"},
+    {"DOGEUSD", "XRPUSD", "SOLUSD"},  # altcoins correlacionadas
+    {"AAPL", "MSFT"},                   # mega cap tech
+    {"AMZN", "TSLA"},                   # growth tech
 ]
 
 
@@ -104,7 +98,7 @@ def _bias_4h(candles_4h):
     return 0
 
 
-def _score_symbol(sym, candles_15m, candles_4h):
+def _score_symbol(sym, candles_15m, candles_4h, regime=None):
     if not candles_15m or len(candles_15m) < 50:
         return None
 
@@ -174,11 +168,18 @@ def _score_symbol(sym, candles_15m, candles_4h):
             "rsi": round(float(rsi_val), 2) if not np.isnan(rsi_val) else 0,
             "atr": details["atr"],
             "filtro": "bias_4h",
+            "regime": regime or "LATERAL",
         }
 
-    if score >= UMBRAL:
+    # Ajuste de umbral segun regimen (LATERAL = +1 mas restrictivo)
+    umbral_extra = 0
+    if regime == "LATERAL":
+        umbral_extra = 1
+    umbral_efectivo = UMBRAL + umbral_extra
+
+    if score >= umbral_efectivo:
         signal = "LONG"
-    elif score <= -UMBRAL:
+    elif score <= -umbral_efectivo:
         signal = "SHORT"
     else:
         signal = "ESPERAR"
@@ -201,24 +202,29 @@ def _score_symbol(sym, candles_15m, candles_4h):
         "tp1":     tp1,
         "rsi":     round(float(rsi_val), 2) if not np.isnan(rsi_val) else 0,
         "atr":     details["atr"],
+        "regime":  regime or "LATERAL",
     }
 
 
 def run_scanner(data_15m, data_4h,
                 open_positions: set = None,
-                cooldown_until: dict = None) -> dict:
+                cooldown_until: dict = None,
+                regimes: dict = None) -> dict:
     if open_positions is None:
         open_positions = set()
     if cooldown_until is None:
         cooldown_until = {}
+    if regimes is None:
+        regimes = {}
 
     now = datetime.now(timezone.utc)
     results = {}
 
     for sym, candles in data_15m.items():
         candles_4h = (data_4h or {}).get(sym)
+        regime     = regimes.get(sym)
         try:
-            res = _score_symbol(sym, candles, candles_4h)
+            res = _score_symbol(sym, candles, candles_4h, regime=regime)
             if res is None:
                 results[sym] = {"signal": "ESPERAR", "score": 0, "error": "datos_insuficientes"}
                 continue
@@ -248,7 +254,8 @@ def run_scanner(data_15m, data_4h,
             results[sym] = res
             logger.info(
                 f"[scanner] {sym}: {res['signal']} score={res['score']} "
-                f"rsi={res.get('rsi','?')} atr={res.get('atr','?')}"
+                f"rsi={res.get('rsi','?')} atr={res.get('atr','?')} "
+                f"regime={res.get('regime','?')}"
             )
         except Exception as e:
             logger.error(f"[scanner] {sym}: {e}")
