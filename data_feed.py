@@ -1,8 +1,10 @@
 """
-data_feed.py — Bot Scalper
+data_feed.py — Bot Scalper v3
 Descarga velas OHLCV de Capital.com:
 - 15min: para el scanner (100 velas)
 - 4H:    para el bias direccional (50 velas)
+
+Activos v3: alta volatilidad, separados del Bot Swing.
 """
 
 import logging
@@ -12,18 +14,17 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://demo-api-capital.backend-capital.com"
 
-# 10 activos del Bot Scalper (sin NATURAL GAS)
+# 9 activos del Bot Scalper v3 — alta volatilidad, distintos al Swing
 CAPITAL_EPICS = {
-    "BTCUSD":  "BITCOIN",
-    "ETHUSD":  "ETHEREUM",
-    "NVDA":    "NVDA",
-    "NDAQ":    "NDAQ",
-    "SILVER":  "SILVER",
-    "GBPUSD":  "GBPUSD",
-    "GOLD":    "GOLD",
-    "USOIL":   "OIL_CRUDE",
-    "EURUSD":  "EURUSD",
-    "US500":   "US500",
+    "US100":   "US100",
+    "GBPJPY":  "GBPJPY",
+    "DOGEUSD": "DOGEUSD",
+    "XRPUSD":  "XRPUSD",
+    "SOLUSD":  "SOLUSD",
+    "AMZN":    "AMZN",
+    "TSLA":    "TSLA",
+    "AAPL":    "AAPL",
+    "MSFT":    "MSFT",
 }
 
 
@@ -64,7 +65,7 @@ def _fetch(epic, client, resolution, limit):
 
 def get_all_ohlcv(client):
     """
-    Descarga velas 15min y 4H para los 10 activos.
+    Descarga velas 15min y 4H para los 9 activos.
     Retorna:
         data_15m: { sym: [candles] | None }
         data_4h:  { sym: [candles] | None }
@@ -73,7 +74,6 @@ def get_all_ohlcv(client):
     data_4h  = {}
 
     for sym, epic in CAPITAL_EPICS.items():
-        # 15 minutos — 100 velas (~25 horas de historia)
         try:
             data_15m[sym] = _fetch(epic, client, "MINUTE_15", 100)
             logger.info(f"[data_feed] {sym} 15m: {len(data_15m[sym])} velas OK")
@@ -81,7 +81,6 @@ def get_all_ohlcv(client):
             logger.warning(f"[data_feed] {sym} 15m: ERROR — {e}")
             data_15m[sym] = None
 
-        # 4 horas — 50 velas (~8 dias de historia para bias)
         try:
             data_4h[sym] = _fetch(epic, client, "HOUR_4", 50)
             logger.info(f"[data_feed] {sym} 4H: {len(data_4h[sym])} velas OK")
