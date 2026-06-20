@@ -8,7 +8,7 @@ Cambios v3 vs v2:
 - Regimen de mercado (ALCISTA/BAJISTA/LATERAL) via regime_detector.py
 - sizing_mult por regimen pasado a client.open_position
 - Fix: client.security -> client.x_token
-- START_TRADING_UTC: no abre posiciones antes del lunes 2026-06-23 15:00 UTC
+- Sin restricción de fecha: opera desde el primer ciclo
 """
 
 import os
@@ -39,7 +39,6 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 # No abrir posiciones nuevas antes de esta fecha/hora
 # Protege posiciones pre-v3 que Matias cierra manualmente
-START_TRADING_UTC = datetime(2026, 6, 23, 15, 0, 0, tzinfo=timezone.utc)
 
 scanner_state  = {}
 scanner_lock   = threading.Lock()
@@ -130,15 +129,6 @@ def run_cycle():
         scanner_state.update(results)
         last_scan_time = datetime.utcnow().isoformat() + "Z"
 
-    now = _now_utc()
-    trading_habilitado = now >= START_TRADING_UTC
-    if not trading_habilitado:
-        remaining = int((START_TRADING_UTC - now).total_seconds() / 3600)
-        logger.info(
-            f"[main] START_TRADING_UTC no alcanzado — no se abren posiciones nuevas "
-            f"({remaining}h restantes)"
-        )
-
     for sym, res in results.items():
         if sym not in valid_syms:
             logger.info(f"[main] {sym}: sin datos - posicion protegida")
@@ -164,8 +154,6 @@ def run_cycle():
                     logger.debug(f"[main] {sym}: ESPERAR - sin posicion propia")
 
             elif signal in ("LONG", "SHORT"):
-                if not trading_habilitado:
-                    continue
 
                 with own_positions_lock:
                     if sym in own_positions:
@@ -210,7 +198,7 @@ def run_cycle():
                     own_positions.pop(sym, None)
                 with cooldown_until_lock:
                     cooldown_until[sym] = _now_utc() + COOLDOWN_DURATION
-                logger.info(f"[main] {sym}: SL dtectado - cooldown activado")
+                logger.info(f"[main] {sym}: SL detectado - cooldown activado")
             scan_errors[sym] = str(e)
             logger.error(f"[main] {sym}: {e}\n{traceback.format_exc()}")
 
@@ -267,8 +255,7 @@ def health():
         "own_positions":        pos_copy,
         "cooldowns":            cd_copy,
         "regimes":              reg_copy,
-        "trading_habilitado":   now >= START_TRADING_UTC,
-        "start_trading_utc":    START_TRADING_UTC.isoformat(),
+        "trading_habilitado":   True,
     }), 200
 
 
