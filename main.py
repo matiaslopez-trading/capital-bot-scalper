@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v3
+main.py â Bot Scalper v3
 Flask + APScheduler. Ciclo cada 5 minutos.
 9 activos nuevos de alta volatilidad en 15min con bias de 4H.
 
@@ -8,7 +8,7 @@ Cambios v3 vs v2:
 - Regimen de mercado (ALCISTA/BAJISTA/LATERAL) via regime_detector.py
 - sizing_mult por regimen pasado a client.open_position
 - Fix: client.security -> client.x_token
-- Sin restricción de fecha: opera desde el primer ciclo
+- Sin restricciÃ³n de fecha: opera desde el primer ciclo
 """
 
 import os
@@ -53,7 +53,7 @@ cooldown_until_lock = threading.Lock()
 
 COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 15)
 
-# Regimenes por activo — se actualiza una vez por dia
+# Regimenes por activo â se actualiza una vez por dia
 current_regimes      = {}
 current_regimes_lock = threading.Lock()
 last_regime_update   = None
