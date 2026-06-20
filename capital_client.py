@@ -1,6 +1,6 @@
 """
 capital_client.py
-Cliente para la API REST de Capital.com (modo demo) — Bot Scalper v3.
+Cliente para la API REST de Capital.com (modo demo) â Bot Scalper v3.
 """
 
 import os
@@ -27,8 +27,10 @@ SYMBOL_MAP = {
     "MSFT":    "MSFT",
 }
 
+# % del capital total a arriesgar segun nivel de score
 PCT_POR_SCORE = {2: 0.02, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
+# Tamanio minimo permitido por Capital.com (floor de seguridad)
 MIN_SIZE = {
     "US100":   0.1,
     "GBPJPY":  1000.0,
@@ -88,6 +90,7 @@ class CapitalClient:
         return resp.json().get("accounts", [])
 
     def get_balance(self):
+        """Retorna el balance disponible de la cuenta demo."""
         try:
             accounts = self.get_accounts()
             for acc in accounts:
@@ -96,7 +99,7 @@ class CapitalClient:
                     return float(balance)
         except Exception as e:
             logger.warning(f"[client] No se pudo obtener balance: {e}")
-        return 1000.0
+        return 1000.0  # fallback conservador
 
     def get_positions(self):
         self.ensure_session()
@@ -120,11 +123,15 @@ class CapitalClient:
             )
             try:
                 resp = requests.get(url, headers=self._headers(), timeout=15)
+                if resp.status_code == 400:
+                    logger.warning(f"[client] activity: endpoint no disponible (400) â omitiendo")
+                    break
                 resp.raise_for_status()
                 data = resp.json().get("activities", [])
                 all_activities.extend(data)
             except Exception as e:
                 logger.warning(f"[client] activity day -{day}: {e}")
+                break
         return all_activities
 
     def open_position(self, symbol, action, entry, sl, tp1, score=2, sizing_mult=1.0):
@@ -132,6 +139,7 @@ class CapitalClient:
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
             return None
+        # Verificar si ya hay posicion abierta para este epic
         try:
             positions = self.get_positions()
             for p in positions:
@@ -141,6 +149,7 @@ class CapitalClient:
         except Exception as e:
             logger.warning(f"[client] {symbol}: no se pudo verificar posiciones: {e}")
         direction = "BUY" if action == "LONG" else "SELL"
+        # Sizing dinamico: % del capital segun score, ajustado por regimen
         pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02) * sizing_mult
         balance  = self.get_balance()
         risk_usd = balance * pct
@@ -166,7 +175,7 @@ class CapitalClient:
                 except Exception:
                     detail = resp.text
                 logger.warning(
-                    f"[client] {symbol}: posicion rechazada (400) — "
+                    f"[client] {symbol}: posicion rechazada (400) â "
                     f"posiblemente mercado cerrado: {detail}"
                 )
                 return None
@@ -195,8 +204,4 @@ class CapitalClient:
                 deal_id = p.get("position", {}).get("dealId")
                 if deal_id:
                     try:
-                        self.close_position(deal_id)
-                        closed = True
-                    except Exception as e:
-                        logger.error(f"[client] Error cerrando {deal_id}: {e}")
-        return closed
+                        self.close_position
