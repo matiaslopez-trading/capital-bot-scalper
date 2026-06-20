@@ -204,8 +204,7 @@ class CapitalClient:
                 deal_id = p.get("position", {}).get("dealId")
                 if deal_id:
                     try:
-                        self.close_position
-(deal_id)
+                        self.close_position(deal_id)
                         closed = True
                     except Exception as e:
                         logger.error(f"[client] Error cerrando {deal_id}: {e}")
