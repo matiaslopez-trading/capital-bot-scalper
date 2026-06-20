@@ -1,9 +1,12 @@
 """
-main.py — Bot Scalper
+main.py — Bot Scalper v2
 Flask + APScheduler. Ciclo cada 5 minutos.
 10 activos en 15min con bias de 4H.
-PROTECCION: si datos fallan, ciclo abortado. Posiciones protegidas.
-DEAL TRACKING: cada bot solo cierra sus propios deals (evita conflicto con Bot Swing).
+
+Mejoras v2:
+- Cooldown tracking: 30 min bloqueado por activo tras SL
+- open_positions pasado al scanner (correlaciones)
+- Version bumped a v2
 """
 
 import os
@@ -12,13 +15,13 @@ import logging
 import threading
 import traceback
 import time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
 from capital_client import CapitalClient
 from apscheduler.schedulers.background import BackgroundScheduler
 from data_feed import get_all_ohlcv
-from scanner import run_scanner
+from scanner import run_scanner, COOLDOWN_VELAS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app    = Flask(__name__)
+app = Flask(__name__)
 client = CapitalClient()
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -36,9 +39,17 @@ scanner_lock   = threading.Lock()
 last_scan_time = None
 scan_errors    = {}
 
-# ── Deal tracking: solo cerramos posiciones que abrimos nosotros ──
 own_positions      = {}
 own_positions_lock = threading.Lock()
+
+cooldown_until      = {}
+cooldown_until_lock = threading.Lock()
+
+COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 15)
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
 
 
 def run_cycle():
@@ -61,13 +72,20 @@ def run_cycle():
 
     valid_syms = {sym for sym, rows in data_15m.items() if rows is not None}
     if not valid_syms:
-        logger.warning("[main] CICLO ABORTADO — sin datos validos. Posiciones protegidas sin cambios.")
+        logger.warning("[main] CICLO ABORTADO - sin datos validos. Posiciones protegidas.")
         return
 
     logger.info(f"[main] Datos 15m validos: {len(valid_syms)}/10 activos")
 
+    with own_positions_lock:
+        open_pos_set = set(own_positions.keys())
+    with cooldown_until_lock:
+        cd_snapshot = dict(cooldown_until)
+
     try:
-        results = run_scanner(data_15m, data_4h)
+        results = run_scanner(data_15m, data_4h,
+                              open_positions=open_pos_set,
+                              cooldown_until=cd_snapshot)
     except Exception as e:
         logger.error(f"[main] Error en scanner: {e}")
         return
@@ -79,7 +97,7 @@ def run_cycle():
 
     for sym, res in results.items():
         if sym not in valid_syms:
-            logger.info(f"[main] {sym}: sin datos — posicion protegida")
+            logger.info(f"[main] {sym}: sin datos - posicion protegida")
             continue
         signal = res.get("signal", "ESPERAR")
         score  = res.get("score", 0)
@@ -99,19 +117,24 @@ def run_cycle():
                             with own_positions_lock:
                                 own_positions.pop(sym, None)
                 else:
-                    logger.debug(f"[main] {sym}: ESPERAR — sin posicion propia abierta")
+                    logger.debug(f"[main] {sym}: ESPERAR - sin posicion propia")
 
             elif signal in ("LONG", "SHORT"):
                 with own_positions_lock:
-                    already_open = sym in own_positions
-                if already_open:
-                    logger.info(f"[main] {sym}: {signal} — posicion propia ya abierta, omitiendo")
-                    continue
+                    if sym in own_positions:
+                        logger.info(f"[main] {sym}: {signal} - posicion propia ya abierta")
+                        continue
+
                 entry = res.get("entry", 0)
                 sl    = res.get("sl", 0)
                 tp1   = res.get("tp1", 0)
                 if entry and sl and tp1:
-                    deal = client.open_position(symbol=sym, action=signal, entry=entry, sl=sl, tp1=tp1, score=score)
+                    deal = client.open_position(
+                        symbol=sym, action=signal,
+                        entry=entry, sl=sl, tp1=tp1, score=score
+                    )
+                    if deal is None:
+                        continue
                     if deal:
                         deal_id = (
                             deal.get("dealId") or
@@ -121,12 +144,31 @@ def run_cycle():
                         if deal_id:
                             with own_positions_lock:
                                 own_positions[sym] = deal_id
-                            logger.info(f"[main] {sym}: {signal} @ {entry} SL={sl} TP={tp1} score={score} deal={deal_id}")
+                            logger.info(
+                                f"[main] {sym}: {signal} @ {entry} "
+                                f"SL={sl} TP={tp1} ATR={res.get('atr','?')} "
+                                f"score={score} deal={deal_id}"
+                            )
                         else:
                             logger.warning(f"[main] {sym}: posicion abierta sin dealId: {deal}")
+
         except Exception as e:
+            err_str = str(e).lower()
+            if "position" in err_str and ("closed" in err_str or "not found" in err_str or "404" in err_str):
+                with own_positions_lock:
+                    own_positions.pop(sym, None)
+                with cooldown_until_lock:
+                    cooldown_until[sym] = _now_utc() + COOLDOWN_DURATION
+                logger.info(f"[main] {sym}: SL detectado - cooldown activado")
             scan_errors[sym] = str(e)
             logger.error(f"[main] {sym}: {e}\n{traceback.format_exc()}")
+
+    with cooldown_until_lock:
+        now = _now_utc()
+        vencidos = [s for s, t in cooldown_until.items() if now >= t]
+        for s in vencidos:
+            del cooldown_until[s]
+            logger.info(f"[main] {s}: cooldown vencido - activo nuevamente")
 
 
 def start_scheduler():
@@ -143,12 +185,12 @@ def start_scheduler():
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(run_cycle, "interval", minutes=5, id="scalper_cycle")
     scheduler.start()
-    logger.info("[main] Scheduler activo — ciclo cada 5 minutos.")
+    logger.info("[main] Scheduler activo - ciclo cada 5 minutos.")
 
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
@@ -157,11 +199,20 @@ def add_cors_headers(response):
 @app.route("/", methods=["GET"])
 def health():
     with scanner_lock:
-        n = sum(1 for r in scanner_state.values() if r.get("signal") in ("LONG","SHORT"))
+        n = sum(1 for r in scanner_state.values() if r.get("signal") in ("LONG", "SHORT"))
     with own_positions_lock:
         pos_copy = dict(own_positions)
-    return jsonify({"status": "ok", "bot": "Bot Scalper v1", "activos": 10,
-                    "last_scan": last_scan_time, "signals": n, "own_positions": pos_copy}), 200
+    with cooldown_until_lock:
+        cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
+    return jsonify({
+        "status":         "ok",
+        "bot":            "Bot Scalper v2",
+        "activos":        10,
+        "last_scan":      last_scan_time,
+        "signals":        n,
+        "own_positions":  pos_copy,
+        "cooldowns":      cd_copy,
+    }), 200
 
 
 @app.route("/signals", methods=["GET"])
@@ -170,8 +221,15 @@ def signals():
         state_copy = dict(scanner_state)
     with own_positions_lock:
         pos_copy = dict(own_positions)
-    return jsonify({"last_scan": last_scan_time, "signals": state_copy,
-                    "errors": scan_errors, "own_positions": pos_copy}), 200
+    with cooldown_until_lock:
+        cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
+    return jsonify({
+        "last_scan":     last_scan_time,
+        "signals":       state_copy,
+        "errors":        scan_errors,
+        "own_positions": pos_copy,
+        "cooldowns":     cd_copy,
+    }), 200
 
 
 @app.route("/scan", methods=["GET"])
@@ -183,13 +241,16 @@ def scan_now():
         state_copy = dict(scanner_state)
     with own_positions_lock:
         pos_copy = dict(own_positions)
-    return jsonify({"last_scan": last_scan_time, "signals": state_copy,
-                    "errors": scan_errors, "own_positions": pos_copy}), 200
+    return jsonify({
+        "last_scan":     last_scan_time,
+        "signals":       state_copy,
+        "errors":        scan_errors,
+        "own_positions": pos_copy,
+    }), 200
 
 
 @app.route("/stats", methods=["GET"])
 def stats():
-    """Endpoint para el dashboard — retorna posiciones, cuenta e historial."""
     try:
         positions  = client.get_positions()
         accounts   = client.get_accounts()
@@ -197,7 +258,7 @@ def stats():
         with own_positions_lock:
             pos_copy = dict(own_positions)
         return jsonify({
-            "bot":           "Bot Scalper v1",
+            "bot":           "Bot Scalper v2",
             "own_positions": pos_copy,
             "positions":     positions,
             "accounts":      accounts,
