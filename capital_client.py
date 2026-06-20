@@ -9,6 +9,7 @@ import logging
 import requests
 from datetime import datetime, timedelta
 
+# fix: force clean rebuild
 logger = logging.getLogger(__name__)
 
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
