@@ -22,7 +22,7 @@ BB_STD       = 2.0
 VOL_MULT     = 1.5
 ATR_MULT_SL  = 1.5
 ATR_MULT_TP  = 3.0
-UMBRAL       = 3
+UMBRAL       = 2
 COOLDOWN_VELAS = 2
 
 # Activos v3 — alta volatilidad
@@ -160,7 +160,7 @@ def _score_symbol(sym, candles_15m, candles_4h, regime=None):
 
     bias = _bias_4h(candles_4h)
     details["bias_4h"] = bias
-    if bias != 0 and int(np.sign(score)) != bias:
+    if bias != 0 and score != 0 and int(np.sign(score)) != bias:
         logger.info(f"[scanner] {sym}: bloqueado bias 4H ({bias:+d}) score={score}")
         return {
             "signal": "ESPERAR", "score": score, "details": details,
