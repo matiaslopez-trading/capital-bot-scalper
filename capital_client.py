@@ -149,12 +149,19 @@ class CapitalClient:
         except Exception as e:
             logger.warning(f"[client] {symbol}: no se pudo verificar posiciones: {e}")
         direction = "BUY" if action == "LONG" else "SELL"
-        # Sizing dinamico: % del capital segun score, ajustado por regimen
+        # Sizing correcto: arriesgar risk_usd exactos sobre la distancia al SL
         pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02) * sizing_mult
         balance  = self.get_balance()
         risk_usd = balance * pct
-        size     = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        size     = max(size, MIN_SIZE.get(epic, 1.0))
+        sl_dist  = abs(entry - sl) if sl and sl != entry else 0
+        if sl_dist > 0:
+            size = round(risk_usd / sl_dist, 4)
+        else:
+            size = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
+        # Cap: no mas del 25% del balance en margen por posicion (proteccion cuenta 1k)
+        if entry > 0:
+            size = min(size, round((balance * 0.25) / entry, 4))
+        size = max(size, MIN_SIZE.get(epic, 1.0))
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
         body = {
