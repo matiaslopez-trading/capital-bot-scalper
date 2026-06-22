@@ -1,14 +1,14 @@
 """
-main.py â Bot Scalper v3
+main.py — Bot Scalper v4
 Flask + APScheduler. Ciclo cada 5 minutos.
-9 activos nuevos de alta volatilidad en 15min con bias de 4H.
+9 activos en 15min con bias 4H.
 
-Cambios v3 vs v2:
-- Nuevos 9 activos (US100, GBPJPY, DOGEUSD, XRPUSD, SOLUSD, AMZN, TSLA, AAPL, MSFT)
-- Regimen de mercado (ALCISTA/BAJISTA/LATERAL) via regime_detector.py
-- sizing_mult por regimen pasado a client.open_position
-- Fix: client.security -> client.x_token
-- Sin restricciÃ³n de fecha: opera desde el primer ciclo
+Cambios v4 vs v3:
+- Estrategia IFTRSI (reemplaza ADX/momentum)
+- Exit dinámico: cierra posición cuando IFTRSI llega al umbral de salida
+- Trailing stop: mueve SL a BE al 25% del camino al TP, luego protege 25% de ganancias
+- Sin regime_detector (eliminado)
+- score fijo = 2 para todas las entradas IFTRSI
 """
 
 import os
@@ -24,7 +24,6 @@ from capital_client import CapitalClient
 from apscheduler.schedulers.background import BackgroundScheduler
 from data_feed import get_all_ohlcv, CAPITAL_EPICS
 from scanner import run_scanner, COOLDOWN_VELAS
-import regime_detector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,53 +31,169 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app    = Flask(__name__)
 client = CapitalClient()
 
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
+COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 15)
 
-# No abrir posiciones nuevas antes de esta fecha/hora
-# Protege posiciones pre-v3 que Matias cierra manualmente
-
+# Estado del scanner
 scanner_state  = {}
 scanner_lock   = threading.Lock()
 last_scan_time = None
 scan_errors    = {}
 
+# Posiciones propias: {sym: deal_id}
 own_positions      = {}
 own_positions_lock = threading.Lock()
 
+# Cooldowns: {sym: datetime_utc}
 cooldown_until      = {}
 cooldown_until_lock = threading.Lock()
 
-COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 15)
-
-# Regimenes por activo â se actualiza una vez por dia
-current_regimes      = {}
-current_regimes_lock = threading.Lock()
-last_regime_update   = None
+# Trailing stop tracking: {deal_id: {"be_done": bool, "lock25_done": bool}}
+trailing_state      = {}
+trailing_state_lock = threading.Lock()
 
 
 def _now_utc():
     return datetime.now(timezone.utc)
 
 
-def _update_regimes_if_needed():
-    """Actualiza regimenes de mercado una vez por dia."""
-    global last_regime_update
-    today = _now_utc().strftime("%Y-%m-%d")
-    if last_regime_update == today:
-        return
-    try:
-        regimes = regime_detector.fetch_and_update(client, CAPITAL_EPICS)
-        with current_regimes_lock:
-            current_regimes.clear()
-            current_regimes.update(regimes)
-        last_regime_update = today
-        logger.info(f"[main] Regimenes actualizados: {regimes}")
-    except Exception as e:
-        logger.warning(f"[main] No se pudo actualizar regimenes: {e}")
+# ── Gestión de posiciones abiertas ────────────────────────────────────────────
 
+def _manage_open_positions(positions_api, signals):
+    """
+    Recorre las posiciones abiertas y aplica:
+    1. Exit dinámico por IFTRSI (salida antes de que invierta)
+    2. Trailing stop: BE al 25% del TP, luego +25% al 50% del TP
+    """
+    now = _now_utc()
+
+    from capital_client import SYMBOL_MAP
+    epic_to_sym = {v: k for k, v in SYMBOL_MAP.items()}
+
+    with own_positions_lock:
+        own_pos_copy = dict(own_positions)
+
+    for pos in positions_api:
+        try:
+            market   = pos.get("market", {})
+            position = pos.get("position", {})
+
+            epic      = market.get("epic", "")
+            sym       = epic_to_sym.get(epic)
+            if not sym:
+                continue
+
+            deal_id   = position.get("dealId", "")
+            direction = position.get("direction", "")
+            pnl       = float(position.get("unrealisedPnl", 0) or 0)
+            entry     = float(position.get("level", 0) or 0)
+            sl        = float(position.get("stopLevel", 0) or 0)
+            tp        = float(position.get("limitLevel", 0) or 0)
+            size      = float(position.get("size", 0) or 0)
+
+            if own_pos_copy.get(sym) != deal_id:
+                continue
+
+            sig           = signals.get(sym, {})
+            iftrsi        = sig.get("iftrsi", 0)
+            exit_L_thresh = sig.get("exit_long_thresh", 0.5)
+            exit_S_thresh = sig.get("exit_short_thresh", -0.5)
+
+            # ── 1. Exit dinámico por IFTRSI ───────────────────────────────
+            should_exit = False
+            if direction == "BUY" and iftrsi >= exit_L_thresh:
+                logger.info(
+                    f"[manage] {sym} LONG: IFTRSI={iftrsi:+.3f} >= exit_L={exit_L_thresh} "
+                    f"→ cerrando anticipadamente (PnL={pnl:+.2f})"
+                )
+                should_exit = True
+            elif direction == "SELL" and iftrsi <= exit_S_thresh:
+                logger.info(
+                    f"[manage] {sym} SHORT: IFTRSI={iftrsi:+.3f} <= exit_S={exit_S_thresh} "
+                    f"→ cerrando anticipadamente (PnL={pnl:+.2f})"
+                )
+                should_exit = True
+
+            if should_exit:
+                try:
+                    client.close_position(deal_id)
+                    with own_positions_lock:
+                        own_positions.pop(sym, None)
+                    with trailing_state_lock:
+                        trailing_state.pop(deal_id, None)
+                    with cooldown_until_lock:
+                        cooldown_until[sym] = now + COOLDOWN_DURATION
+                    logger.info(f"[manage] {sym}: cerrado por IFTRSI exit, cooldown activado")
+                except Exception as e:
+                    logger.error(f"[manage] {sym}: error cerrando {deal_id}: {e}")
+                    if "404" in str(e) or "not found" in str(e).lower():
+                        with own_positions_lock:
+                            own_positions.pop(sym, None)
+                        with trailing_state_lock:
+                            trailing_state.pop(deal_id, None)
+                continue
+
+            # ── 2. Trailing stop ───────────────────────────────────────────
+            if pnl <= 0 or entry <= 0 or sl <= 0 or tp <= 0 or size <= 0:
+                continue
+
+            tp_dist_price = abs(tp - entry)
+            if tp_dist_price == 0:
+                continue
+
+            tp_usd = tp_dist_price * size
+
+            with trailing_state_lock:
+                ts = trailing_state.setdefault(deal_id, {"be_done": False, "lock25_done": False})
+                be_done     = ts["be_done"]
+                lock25_done = ts["lock25_done"]
+
+            # Nivel 1: al 25% del TP → mover SL a breakeven
+            if not be_done and pnl >= tp_usd * 0.25:
+                if direction == "BUY":
+                    new_sl = round(entry * 1.001, 5)
+                    if new_sl > sl:
+                        result = client.update_sl(deal_id, new_sl)
+                        if result is not None:
+                            with trailing_state_lock:
+                                trailing_state[deal_id]["be_done"] = True
+                            logger.info(f"[manage] {sym} LONG trailing: BE → SL={new_sl}")
+                else:
+                    new_sl = round(entry * 0.999, 5)
+                    if sl == 0 or new_sl < sl:
+                        result = client.update_sl(deal_id, new_sl)
+                        if result is not None:
+                            with trailing_state_lock:
+                                trailing_state[deal_id]["be_done"] = True
+                            logger.info(f"[manage] {sym} SHORT trailing: BE → SL={new_sl}")
+
+            # Nivel 2: al 50% del TP → bloquear 25% de ganancia
+            if be_done and not lock25_done and pnl >= tp_usd * 0.50:
+                if direction == "BUY":
+                    new_sl = round(entry + tp_dist_price * 0.25, 5)
+                    if new_sl > sl:
+                        result = client.update_sl(deal_id, new_sl)
+                        if result is not None:
+                            with trailing_state_lock:
+                                trailing_state[deal_id]["lock25_done"] = True
+                            logger.info(f"[manage] {sym} LONG trailing: lock25% → SL={new_sl}")
+                else:
+                    new_sl = round(entry - tp_dist_price * 0.25, 5)
+                    if sl == 0 or new_sl < sl:
+                        result = client.update_sl(deal_id, new_sl)
+                        if result is not None:
+                            with trailing_state_lock:
+                                trailing_state[deal_id]["lock25_done"] = True
+                            logger.info(f"[manage] {sym} SHORT trailing: lock25% → SL={new_sl}")
+
+        except Exception as e:
+            logger.error(f"[manage] Error procesando posicion: {e}\n{traceback.format_exc()}")
+
+
+# ── Ciclo principal ────────────────────────────────────────────────────────────
 
 def run_cycle():
     global last_scan_time
@@ -91,9 +206,6 @@ def run_cycle():
     except Exception as e:
         logger.error(f"[main] Error en login: {e}")
         return
-
-    # Actualizar regimenes una vez al dia
-    _update_regimes_if_needed()
 
     try:
         data_15m, data_4h = get_all_ohlcv(client)
@@ -112,14 +224,13 @@ def run_cycle():
         open_pos_set = set(own_positions.keys())
     with cooldown_until_lock:
         cd_snapshot = dict(cooldown_until)
-    with current_regimes_lock:
-        regimes_snapshot = dict(current_regimes)
 
     try:
-        results = run_scanner(data_15m, data_4h,
-                              open_positions=open_pos_set,
-                              cooldown_until=cd_snapshot,
-                              regimes=regimes_snapshot)
+        results = run_scanner(
+            data_15m, data_4h,
+            open_positions=open_pos_set,
+            cooldown_until=cd_snapshot,
+        )
     except Exception as e:
         logger.error(f"[main] Error en scanner: {e}")
         return
@@ -129,31 +240,24 @@ def run_cycle():
         scanner_state.update(results)
         last_scan_time = datetime.utcnow().isoformat() + "Z"
 
+    # ── Gestionar posiciones abiertas (exit dinámico + trailing) ──────────────
+    try:
+        positions_api = client.get_positions()
+        if positions_api:
+            _manage_open_positions(positions_api, results)
+    except Exception as e:
+        logger.warning(f"[main] No se pudo gestionar posiciones: {e}")
+
+    # ── Abrir nuevas posiciones ────────────────────────────────────────────────
     for sym, res in results.items():
         if sym not in valid_syms:
             logger.info(f"[main] {sym}: sin datos - posicion protegida")
             continue
-        signal = res.get("signal", "ESPERAR")
-        score  = res.get("score", 0)
-        try:
-            if signal == "ESPERAR":
-                with own_positions_lock:
-                    deal_id = own_positions.get(sym)
-                if deal_id:
-                    try:
-                        client.close_position(deal_id)
-                        with own_positions_lock:
-                            own_positions.pop(sym, None)
-                        logger.info(f"[main] {sym}: cerrado deal={deal_id} (ESPERAR, score={score})")
-                    except Exception as e:
-                        logger.error(f"[main] {sym}: error cerrando deal {deal_id}: {e}")
-                        if "404" in str(e) or "not found" in str(e).lower():
-                            with own_positions_lock:
-                                own_positions.pop(sym, None)
-                else:
-                    logger.debug(f"[main] {sym}: ESPERAR - sin posicion propia")
 
-            elif signal in ("LONG", "SHORT"):
+        signal = res.get("signal", "ESPERAR")
+
+        try:
+            if signal in ("LONG", "SHORT"):
 
                 with own_positions_lock:
                     if sym in own_positions:
@@ -163,33 +267,34 @@ def run_cycle():
                 entry = res.get("entry", 0)
                 sl    = res.get("sl", 0)
                 tp1   = res.get("tp1", 0)
+                score = 2  # IFTRSI crossover → score fijo
+
                 if entry and sl and tp1:
-                    # Sizing ajustado por regimen
-                    sizing_mult = regime_detector.get_params(sym).get("sizing_mult", 1.0)
                     deal = client.open_position(
                         symbol=sym, action=signal,
                         entry=entry, sl=sl, tp1=tp1,
-                        score=score, sizing_mult=sizing_mult
+                        score=score, sizing_mult=1.0,
                     )
                     if deal is None:
                         continue
-                    if deal:
-                        deal_id = (
-                            deal.get("dealId") or
-                            deal.get("dealReference") or
-                            deal.get("affectedDeals", [{}])[0].get("dealId")
+                    deal_id = (
+                        deal.get("dealId") or
+                        deal.get("dealReference") or
+                        deal.get("affectedDeals", [{}])[0].get("dealId")
+                    )
+                    if deal_id:
+                        with own_positions_lock:
+                            own_positions[sym] = deal_id
+                        with trailing_state_lock:
+                            trailing_state[deal_id] = {"be_done": False, "lock25_done": False}
+                        logger.info(
+                            f"[main] {sym}: {signal} @ {entry} "
+                            f"SL={sl} TP={tp1} ATR={res.get('atr','?')} "
+                            f"IFTRSI={res.get('iftrsi','?')} bias4h={res.get('bias_4h','?')} "
+                            f"deal={deal_id}"
                         )
-                        if deal_id:
-                            with own_positions_lock:
-                                own_positions[sym] = deal_id
-                            logger.info(
-                                f"[main] {sym}: {signal} @ {entry} "
-                                f"SL={sl} TP={tp1} ATR={res.get('atr','?')} "
-                                f"score={score} regime={res.get('regime','?')} "
-                                f"sizing_mult={sizing_mult} deal={deal_id}"
-                            )
-                        else:
-                            logger.warning(f"[main] {sym}: posicion abierta sin dealId: {deal}")
+                    else:
+                        logger.warning(f"[main] {sym}: posicion abierta sin dealId: {deal}")
 
         except Exception as e:
             err_str = str(e).lower()
@@ -198,10 +303,11 @@ def run_cycle():
                     own_positions.pop(sym, None)
                 with cooldown_until_lock:
                     cooldown_until[sym] = _now_utc() + COOLDOWN_DURATION
-                logger.info(f"[main] {sym}: SL detectado - cooldown activado")
+                logger.info(f"[main] {sym}: SL/cierre externo detectado - cooldown activado")
             scan_errors[sym] = str(e)
             logger.error(f"[main] {sym}: {e}\n{traceback.format_exc()}")
 
+    # Limpiar cooldowns vencidos
     with cooldown_until_lock:
         now = _now_utc()
         vencidos = [s for s, t in cooldown_until.items() if now >= t]
@@ -209,6 +315,8 @@ def run_cycle():
             del cooldown_until[s]
             logger.info(f"[main] {s}: cooldown vencido - activo nuevamente")
 
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
 
 def start_scheduler():
     retries = 0
@@ -227,6 +335,8 @@ def start_scheduler():
     logger.info("[main] Scheduler activo - ciclo cada 5 minutos.")
 
 
+# ── Endpoints Flask ────────────────────────────────────────────────────────────
+
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
@@ -243,19 +353,18 @@ def health():
         pos_copy = dict(own_positions)
     with cooldown_until_lock:
         cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
-    with current_regimes_lock:
-        reg_copy = dict(current_regimes)
-    now = _now_utc()
+    with trailing_state_lock:
+        ts_copy = dict(trailing_state)
     return jsonify({
-        "status":               "ok",
-        "bot":                  "Bot Scalper v3",
-        "activos":              9,
-        "last_scan":            last_scan_time,
-        "signals":              n,
-        "own_positions":        pos_copy,
-        "cooldowns":            cd_copy,
-        "regimes":              reg_copy,
-        "trading_habilitado":   True,
+        "status":             "ok",
+        "bot":                "Bot Scalper v4 (IFTRSI)",
+        "activos":            9,
+        "last_scan":          last_scan_time,
+        "signals":            n,
+        "own_positions":      pos_copy,
+        "cooldowns":          cd_copy,
+        "trailing_state":     ts_copy,
+        "trading_habilitado": True,
     }), 200
 
 
@@ -267,15 +376,15 @@ def signals():
         pos_copy = dict(own_positions)
     with cooldown_until_lock:
         cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
-    with current_regimes_lock:
-        reg_copy = dict(current_regimes)
+    with trailing_state_lock:
+        ts_copy = dict(trailing_state)
     return jsonify({
-        "last_scan":     last_scan_time,
-        "signals":       state_copy,
-        "errors":        scan_errors,
-        "own_positions": pos_copy,
-        "cooldowns":     cd_copy,
-        "regimes":       reg_copy,
+        "last_scan":      last_scan_time,
+        "signals":        state_copy,
+        "errors":         scan_errors,
+        "own_positions":  pos_copy,
+        "cooldowns":      cd_copy,
+        "trailing_state": ts_copy,
     }), 200
 
 
@@ -301,19 +410,19 @@ def stats():
     try:
         positions  = client.get_positions()
         accounts   = client.get_accounts()
-        activities = client.get_activity_history(days=90)
+        activities = client.get_activity_history(days=7)
         with own_positions_lock:
             pos_copy = dict(own_positions)
-        with current_regimes_lock:
-            reg_copy = dict(current_regimes)
+        with trailing_state_lock:
+            ts_copy = dict(trailing_state)
         return jsonify({
-            "bot":           "Bot Scalper v3",
-            "own_positions": pos_copy,
-            "positions":     positions,
-            "accounts":      accounts,
-            "activities":    activities,
-            "last_scan":     last_scan_time,
-            "regimes":       reg_copy,
+            "bot":            "Bot Scalper v4 (IFTRSI)",
+            "own_positions":  pos_copy,
+            "trailing_state": ts_copy,
+            "positions":      positions,
+            "accounts":       accounts,
+            "activities":     activities,
+            "last_scan":      last_scan_time,
         }), 200
     except Exception as e:
         logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
@@ -330,6 +439,8 @@ def webhook():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+# ── Inicio ─────────────────────────────────────────────────────────────────────
 
 try:
     client.login()
