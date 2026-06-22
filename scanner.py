@@ -1,11 +1,13 @@
 """
-scanner.py â Bot Scalper v3.1
-Cambios vs v3:
-- ATR_LEN: 7 -> 14  (mejor estimacion de volatilidad real)
-- ATR_MULT_SL: 1.5 -> 2.5  (SL mas amplio, fuera del ruido)
-- ATR_MULT_TP: 3.0 -> 5.0  (mantiene R:R 2:1 con el nuevo SL)
-- ADX filter agregado: ADX < 20 -> ESPERAR (no operar mercados laterales)
-- Fix bias_4h: solo bloquea cuando score != 0
+scanner.py — Bot Scalper v4
+Estrategia: IFTRSI (Inverse Fisher Transform RSI) — matches TradingView IFTRSI_LB 14 9
+
+Lógica:
+- LONG:  IFTRSI cruza hacia ARRIBA el umbral de oversold (-0.5)
+- SHORT: IFTRSI cruza hacia ABAJO el umbral de overbought (+0.5)
+- Bias 4H: en tendencia bajista exige IFTRSI más extremo para LONG
+            en tendencia alcista exige IFTRSI más extremo para SHORT
+- Exit thresholds: exportados para que main.py cierre anticipadamente
 """
 
 import logging
@@ -14,37 +16,52 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-RSI_LEN        = 9
-EMA_FAST       = 9
-EMA_SLOW       = 21
-ATR_LEN        = 14
-BB_LEN         = 20
-BB_STD         = 2.0
-VOL_MULT       = 1.5
-ATR_MULT_SL    = 2.5
-ATR_MULT_TP    = 5.0
-ADX_LEN        = 14
-ADX_MIN        = 20
-UMBRAL         = 2
-COOLDOWN_VELAS = 2
+# IFTRSI — parámetros idénticos al indicador TradingView IFTRSI_LB 14 9
+RSI_LEN    = 14
+RSI_SMOOTH = 9     # EMA aplicada al RSI antes de la transformada
 
-# Activos v3 â alta volatilidad
+# Umbrales estándar (mercado neutral)
+OB_STD = 0.5    # overbought — entrada SHORT / salida LONG
+OS_STD = -0.5   # oversold   — entrada LONG  / salida SHORT
+
+# Umbrales reforzados (contra tendencia)
+OB_STRONG = 0.7
+OS_STRONG = -0.7
+
+# Multiplicadores SL/TP sobre ATR
+ATR_LEN     = 14
+ATR_MULT_SL = 2.0
+ATR_MULT_TP = 4.0   # R:R 2:1 — el exit dinámico reemplaza al TP en la práctica
+
+COOLDOWN_VELAS = 3
+
 CORRELATION_GROUPS = [
-    {"DOGEUSD", "XRPUSD", "SOLUSD"},  # altcoins correlacionadas
-    {"AAPL", "MSFT"},                   # mega cap tech
-    {"AMZN", "TSLA"},                   # growth tech
+    {"DOGEUSD", "XRPUSD", "SOLUSD"},
+    {"AAPL", "MSFT"},
+    {"AMZN", "TSLA"},
 ]
 
 
+# ── helpers matemáticos ────────────────────────────────────────────────────────
+
 def _ema(arr, period):
-    k = 2.0 / (period + 1)
+    k   = 2.0 / (period + 1)
     out = np.full(len(arr), np.nan, dtype=float)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        if np.isnan(out[i - 1]):
+    # seed con el primer valor no-nan
+    start = 0
+    for i, v in enumerate(arr):
+        if not np.isnan(v):
+            out[i] = v
+            start  = i + 1
+            break
+    for i in range(start, len(arr)):
+        prev = out[i - 1]
+        if np.isnan(prev):
             out[i] = arr[i]
+        elif np.isnan(arr[i]):
+            out[i] = prev
         else:
-            out[i] = arr[i] * k + out[i - 1] * (1 - k)
+            out[i] = arr[i] * k + prev * (1 - k)
     return out
 
 
@@ -65,10 +82,26 @@ def _rsi_wilder(close, period=RSI_LEN):
     return np.concatenate([[np.nan], rsi])
 
 
+def _iftrsi(close, rsi_period=RSI_LEN, smooth=RSI_SMOOTH):
+    """
+    Inverse Fisher Transform del RSI.
+    Resultado oscila limpiamente entre -1 y +1.
+    Fórmula: IFT( EMA(RSI, smooth) )
+    """
+    rsi   = _rsi_wilder(close, rsi_period)
+    rsi_s = _ema(rsi, smooth)
+    x     = np.clip(0.1 * (rsi_s - 50), -10, 10)   # evitar overflow
+    exp2x = np.exp(2 * x)
+    ift   = (exp2x - 1) / (exp2x + 1)
+    return ift
+
+
 def _atr(high, low, close, period=ATR_LEN):
-    tr = np.maximum(high[1:] - low[1:],
-                    np.maximum(np.abs(high[1:] - close[:-1]),
-                               np.abs(low[1:] - close[:-1])))
+    tr = np.maximum(
+        high[1:] - low[1:],
+        np.maximum(np.abs(high[1:] - close[:-1]),
+                   np.abs(low[1:]  - close[:-1]))
+    )
     atr = np.full(len(close), np.nan)
     if period < len(tr):
         atr[period] = np.mean(tr[:period])
@@ -77,72 +110,15 @@ def _atr(high, low, close, period=ATR_LEN):
     return atr
 
 
-def _adx(high, low, close, period=ADX_LEN):
-    """ADX de Wilder â retorna array del mismo largo que close."""
-    n   = len(close)
-    out = np.full(n, np.nan)
-    if n < period * 2 + 1:
-        return out
-
-    up   = high[1:] - high[:-1]
-    down = low[:-1] - low[1:]
-    tr   = np.maximum(high[1:] - low[1:],
-                      np.maximum(np.abs(high[1:] - close[:-1]),
-                                 np.abs(low[1:] - close[:-1])))
-    dm_p = np.where((up > down) & (up > 0), up, 0.0)
-    dm_m = np.where((down > up) & (down > 0), down, 0.0)
-
-    # Inicializar con suma simple de los primeros `period` valores
-    atr_s = np.full(len(tr), np.nan)
-    dmp_s = np.full(len(tr), np.nan)
-    dmm_s = np.full(len(tr), np.nan)
-
-    atr_s[period - 1] = np.sum(tr[:period])
-    dmp_s[period - 1] = np.sum(dm_p[:period])
-    dmm_s[period - 1] = np.sum(dm_m[:period])
-
-    for i in range(period, len(tr)):
-        atr_s[i] = atr_s[i - 1] - atr_s[i - 1] / period + tr[i]
-        dmp_s[i] = dmp_s[i - 1] - dmp_s[i - 1] / period + dm_p[i]
-        dmm_s[i] = dmm_s[i - 1] - dmm_s[i - 1] / period + dm_m[i]
-
-    denom  = np.where(atr_s == 0, 1e-10, atr_s)
-    di_p   = 100 * dmp_s / denom
-    di_m   = 100 * dmm_s / denom
-    dx_den = np.where((di_p + di_m) == 0, 1e-10, di_p + di_m)
-    dx     = 100 * np.abs(di_p - di_m) / dx_den
-
-    # Suavizar DX para obtener ADX
-    adx_arr = np.full(len(tr), np.nan)
-    start   = 2 * period - 2
-    if start < len(dx) and not np.isnan(dx[start - period + 1: start + 1]).any():
-        adx_arr[start] = np.mean(dx[start - period + 1: start + 1])
-        for i in range(start + 1, len(tr)):
-            if not np.isnan(adx_arr[i - 1]) and not np.isnan(dx[i]):
-                adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i]) / period
-
-    # Mapear al array de close (tr tiene len-1)
-    out[1:] = adx_arr
-    return out
-
-
-def _bollinger(close, period=BB_LEN, std=BB_STD):
-    upper, lower = [], []
-    for i in range(period - 1, len(close)):
-        w  = close[i - period + 1: i + 1]
-        m  = np.mean(w)
-        sd = np.std(w)
-        upper.append(m + std * sd)
-        lower.append(m - std * sd)
-    return np.array(upper), np.array(lower)
-
-
 def _bias_4h(candles_4h):
+    """Bias direccional basado en EMA20 de las velas 4H."""
     if not candles_4h or len(candles_4h) < 25:
         return 0
     close = np.array([c["close"] for c in candles_4h], dtype=float)
     ema20 = _ema(close, 20)
-    diff  = (close[-1] - ema20[-1]) / ema20[-1]
+    if np.isnan(ema20[-1]) or ema20[-1] == 0:
+        return 0
+    diff = (close[-1] - ema20[-1]) / ema20[-1]
     if diff > 0.001:
         return 1
     elif diff < -0.001:
@@ -150,132 +126,83 @@ def _bias_4h(candles_4h):
     return 0
 
 
+# ── lógica principal ───────────────────────────────────────────────────────────
+
 def _score_symbol(sym, candles_15m, candles_4h, regime=None):
-    if not candles_15m or len(candles_15m) < 50:
+    # Necesitamos al menos 60 velas para RSI(14) + EMA(9) + algo de historia
+    if not candles_15m or len(candles_15m) < 60:
         return None
 
     close  = np.array([c["close"]  for c in candles_15m], dtype=float)
     high   = np.array([c["high"]   for c in candles_15m], dtype=float)
     low    = np.array([c["low"]    for c in candles_15m], dtype=float)
-    volume = np.array([c["volume"] for c in candles_15m], dtype=float)
 
-    score   = 0
-    details = {}
+    # ── IFTRSI ──────────────────────────────────────────────────────────────
+    ift = _iftrsi(close)
+    if np.isnan(ift[-1]) or np.isnan(ift[-2]):
+        logger.info(f"[scanner] {sym}: IFTRSI NaN — datos insuficientes")
+        return None
 
-    # ââ ADX filter âââââââââââââââââââââââââââââââââââââââââââââââââ
-    adx_arr = _adx(high, low, close, ADX_LEN)
-    adx_val = adx_arr[-1]
-    details["adx"] = round(float(adx_val), 2) if not np.isnan(adx_val) else 0
+    ift_curr = float(ift[-1])
+    ift_prev = float(ift[-2])
 
-    if np.isnan(adx_val) or adx_val < ADX_MIN:
-        logger.info(f"[scanner] {sym}: ADX={details['adx']} < {ADX_MIN} â lateral, ESPERAR")
-        return {
-            "signal": "ESPERAR", "score": 0, "details": details,
-            "entry": float(close[-1]), "sl": 0, "tp1": 0,
-            "rsi": 0, "atr": 0,
-            "filtro": f"adx:{details['adx']}",
-            "regime": regime or "LATERAL",
-        }
-
-    # ââ EMA ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-    ema_f   = _ema(close, EMA_FAST)
-    ema_s   = _ema(close, EMA_SLOW)
-    ema_sig = 1 if ema_f[-1] > ema_s[-1] else -1
-    score  += ema_sig
-    details["ema"] = ema_sig
-
-    # ââ RSI ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
-    rsi_arr = _rsi_wilder(close, RSI_LEN)
-    rsi_val = rsi_arr[-1]
-    if np.isnan(rsi_val):
-        rsi_sig = 0
-    elif rsi_val < 30:
-        score += 2;  rsi_sig = 2
-    elif rsi_val > 70:
-        score -= 2;  rsi_sig = -2
-    elif rsi_val < 45:
-        score += 1;  rsi_sig = 1
-    elif rsi_val > 55:
-        score -= 1;  rsi_sig = -1
-    else:
-        rsi_sig = 0
-    details["rsi"] = rsi_sig
-
-    # ââ Bollinger Bands ââââââââââââââââââââââââââââââââââââââââââââ
-    bb_upper, bb_lower = _bollinger(close)
-    last = close[-1]
-    if last < bb_lower[-1]:
-        score += 1;  bb_sig = 1
-    elif last > bb_upper[-1]:
-        score -= 1;  bb_sig = -1
-    else:
-        bb_sig = 0
-    details["bb"] = bb_sig
-
-    # ââ Volumen ââââââââââââââââââââââââââââââââââââââââââââââââââââ
-    vol_avg = np.mean(volume[-20:])
-    if vol_avg > 0 and volume[-1] > vol_avg * VOL_MULT:
-        if score > 0:
-            score += 1;  vol_sig = 1
-        elif score < 0:
-            score -= 1;  vol_sig = -1
-        else:
-            vol_sig = 0
-    else:
-        vol_sig = 0
-    details["vol"] = vol_sig
-
-    # ââ ATR ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── ATR para SL/TP ──────────────────────────────────────────────────────
     atr_arr = _atr(high, low, close, ATR_LEN)
-    atr_val = atr_arr[-1]
-    details["atr"] = round(float(atr_val), 5) if not np.isnan(atr_val) else 0
+    atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
+    last    = float(close[-1])
 
-    # ââ Bias 4H ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+    # ── Bias 4H ─────────────────────────────────────────────────────────────
     bias = _bias_4h(candles_4h)
-    details["bias_4h"] = bias
-    if bias != 0 and score != 0 and int(np.sign(score)) != bias:
-        logger.info(f"[scanner] {sym}: bloqueado bias 4H ({bias:+d}) score={score}")
-        return {
-            "signal": "ESPERAR", "score": score, "details": details,
-            "entry": float(last), "sl": 0, "tp1": 0,
-            "rsi": round(float(rsi_val), 2) if not np.isnan(rsi_val) else 0,
-            "atr": details["atr"],
-            "filtro": "bias_4h",
-            "regime": regime or "LATERAL",
-        }
 
-    # ââ Umbral segun regimen âââââââââââââââââââââââââââââââââââââââ
-    umbral_extra    = 1 if regime == "LATERAL" else 0
-    umbral_efectivo = UMBRAL + umbral_extra
+    # ── Umbrales dinámicos según tendencia 4H ───────────────────────────────
+    if bias == -1:
+        entry_long_thresh  = OS_STRONG
+        entry_short_thresh = OB_STD
+        exit_long_thresh   = 0.3
+        exit_short_thresh  = -0.5
+    elif bias == 1:
+        entry_long_thresh  = OS_STD
+        entry_short_thresh = OB_STRONG
+        exit_long_thresh   = 0.5
+        exit_short_thresh  = -0.3
+    else:
+        entry_long_thresh  = OS_STD
+        entry_short_thresh = OB_STD
+        exit_long_thresh   = OB_STD
+        exit_short_thresh  = OS_STD
 
-    if score >= umbral_efectivo:
+    # ── Señal de entrada: cruce del umbral ───────────────────────────────────
+    if ift_prev <= entry_long_thresh and ift_curr > entry_long_thresh:
         signal = "LONG"
-    elif score <= -umbral_efectivo:
+    elif ift_prev >= entry_short_thresh and ift_curr < entry_short_thresh:
         signal = "SHORT"
     else:
         signal = "ESPERAR"
 
-    # ââ SL / TP con ATR mas amplio âââââââââââââââââââââââââââââââââ
-    if signal == "LONG" and not np.isnan(atr_val) and atr_val > 0:
+    # ── SL / TP basados en ATR ───────────────────────────────────────────────
+    if signal == "LONG" and atr_val > 0:
         sl  = round(last - atr_val * ATR_MULT_SL, 5)
         tp1 = round(last + atr_val * ATR_MULT_TP, 5)
-    elif signal == "SHORT" and not np.isnan(atr_val) and atr_val > 0:
+    elif signal == "SHORT" and atr_val > 0:
         sl  = round(last + atr_val * ATR_MULT_SL, 5)
         tp1 = round(last - atr_val * ATR_MULT_TP, 5)
     else:
-        sl = tp1 = 0
+        sl = tp1 = 0.0
 
     return {
-        "signal":  signal,
-        "score":   score,
-        "details": details,
-        "entry":   float(last),
-        "sl":      sl,
-        "tp1":     tp1,
-        "rsi":     round(float(rsi_val), 2) if not np.isnan(rsi_val) else 0,
-        "atr":     details["atr"],
-        "adx":     details["adx"],
-        "regime":  regime or "LATERAL",
+        "signal":             signal,
+        "iftrsi":             round(ift_curr, 4),
+        "ift_prev":           round(ift_prev, 4),
+        "entry_long_thresh":  entry_long_thresh,
+        "entry_short_thresh": entry_short_thresh,
+        "exit_long_thresh":   exit_long_thresh,
+        "exit_short_thresh":  exit_short_thresh,
+        "entry":              last,
+        "sl":                 sl,
+        "tp1":                tp1,
+        "atr":                round(atr_val, 5),
+        "bias_4h":            bias,
+        "regime":             regime or "NEUTRAL",
     }
 
 
@@ -295,18 +222,22 @@ def run_scanner(data_15m, data_4h,
 
     for sym, candles in data_15m.items():
         candles_4h = (data_4h or {}).get(sym)
-        regime     = regimes.get(sym)
+        regime     = (regimes or {}).get(sym)
         try:
             res = _score_symbol(sym, candles, candles_4h, regime=regime)
             if res is None:
-                results[sym] = {"signal": "ESPERAR", "score": 0, "error": "datos_insuficientes"}
+                results[sym] = {
+                    "signal": "ESPERAR", "iftrsi": 0,
+                    "exit_long_thresh": 0.5, "exit_short_thresh": -0.5,
+                    "error": "datos_insuficientes",
+                }
                 continue
 
             if res["signal"] in ("LONG", "SHORT"):
-                cd_until = cooldown_until.get(sym)
-                if cd_until and now < cd_until:
-                    remaining = int((cd_until - now).total_seconds() / 60)
-                    logger.info(f"[scanner] {sym}: cooldown activo - {remaining} min restantes")
+                cd = cooldown_until.get(sym)
+                if cd and now < cd:
+                    remaining = int((cd - now).total_seconds() / 60)
+                    logger.info(f"[scanner] {sym}: cooldown {remaining}min")
                     res["signal"] = "ESPERAR"
                     res["filtro"] = f"cooldown:{remaining}min"
 
@@ -317,21 +248,26 @@ def run_scanner(data_15m, data_4h,
             if res["signal"] in ("LONG", "SHORT"):
                 for grupo in CORRELATION_GROUPS:
                     if sym in grupo:
-                        bloqueado_por = grupo & open_positions
-                        if bloqueado_por:
-                            logger.info(f"[scanner] {sym}: bloqueado correlacion con {bloqueado_por}")
+                        bloq = grupo & open_positions
+                        if bloq:
                             res["signal"] = "ESPERAR"
-                            res["filtro"] = f"correlacion:{bloqueado_por}"
+                            res["filtro"] = f"correlacion:{bloq}"
                             break
 
             results[sym] = res
             logger.info(
-                f"[scanner] {sym}: {res['signal']} score={res['score']} "
-                f"rsi={res.get('rsi','?')} atr={res.get('atr','?')} "
-                f"adx={res.get('adx','?')} regime={res.get('regime','?')}"
+                f"[scanner] {sym}: {res['signal']} "
+                f"IFTRSI={res['iftrsi']:+.3f} prev={res['ift_prev']:+.3f} "
+                f"bias4h={res['bias_4h']:+d} "
+                f"exit_L={res['exit_long_thresh']} exit_S={res['exit_short_thresh']}"
             )
+
         except Exception as e:
             logger.error(f"[scanner] {sym}: {e}")
-            results[sym] = {"signal": "ESPERAR", "score": 0, "error": str(e)}
+            results[sym] = {
+                "signal": "ESPERAR", "iftrsi": 0,
+                "exit_long_thresh": 0.5, "exit_short_thresh": -0.5,
+                "error": str(e),
+            }
 
     return results
