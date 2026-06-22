@@ -1,6 +1,8 @@
 """
 capital_client.py
-Cliente para la API REST de Capital.com (modo demo) â Bot Scalper v3.
+Cliente para la API REST de Capital.com (modo demo) — Bot Scalper v4.
+Cambios v4:
+- Agrega update_sl(deal_id, new_sl) para trailing stop dinámico
 """
 
 import os
@@ -14,7 +16,7 @@ logger = logging.getLogger(__name__)
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540
 
-# Activos v3: alta volatilidad, distintos al Bot Swing
+# Activos v4: mismos 9 del scalper v3
 SYMBOL_MAP = {
     "US100":   "US100",
     "GBPJPY":  "GBPJPY",
@@ -27,10 +29,10 @@ SYMBOL_MAP = {
     "MSFT":    "MSFT",
 }
 
-# % del capital total a arriesgar segun nivel de score
+# % del balance a arriesgar según score (score fijo 2 para IFTRSI)
 PCT_POR_SCORE = {2: 0.02, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
-# Tamanio minimo permitido por Capital.com (floor de seguridad)
+# Tamaño mínimo Capital.com
 MIN_SIZE = {
     "US100":   0.1,
     "GBPJPY":  1000.0,
@@ -74,7 +76,7 @@ class CapitalClient:
         resp = requests.post(
             url, json=body,
             headers={"X-CAP-API-KEY": self.api_key},
-            timeout=15
+            timeout=15,
         )
         resp.raise_for_status()
         self.cst        = resp.headers.get("CST")
@@ -90,7 +92,7 @@ class CapitalClient:
         return resp.json().get("accounts", [])
 
     def get_balance(self):
-        """Retorna el balance disponible de la cuenta demo."""
+        """Retorna el balance disponible."""
         try:
             accounts = self.get_accounts()
             for acc in accounts:
@@ -124,11 +126,10 @@ class CapitalClient:
             try:
                 resp = requests.get(url, headers=self._headers(), timeout=15)
                 if resp.status_code == 400:
-                    logger.warning(f"[client] activity: endpoint no disponible (400) â omitiendo")
+                    logger.warning("[client] activity: endpoint no disponible (400) — omitiendo")
                     break
                 resp.raise_for_status()
-                data = resp.json().get("activities", [])
-                all_activities.extend(data)
+                all_activities.extend(resp.json().get("activities", []))
             except Exception as e:
                 logger.warning(f"[client] activity day -{day}: {e}")
                 break
@@ -139,7 +140,8 @@ class CapitalClient:
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
             return None
-        # Verificar si ya hay posicion abierta para este epic
+
+        # Verificar posición ya abierta
         try:
             positions = self.get_positions()
             for p in positions:
@@ -148,7 +150,9 @@ class CapitalClient:
                     return None
         except Exception as e:
             logger.warning(f"[client] {symbol}: no se pudo verificar posiciones: {e}")
+
         direction = "BUY" if action == "LONG" else "SELL"
+
         # Sizing correcto: arriesgar risk_usd exactos sobre la distancia al SL
         pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02) * sizing_mult
         balance  = self.get_balance()
@@ -158,10 +162,11 @@ class CapitalClient:
             size = round(risk_usd / sl_dist, 4)
         else:
             size = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        # Cap: no mas del 25% del balance en margen por posicion (proteccion cuenta 1k)
+        # Cap: no más del 25% del balance en margen por posición
         if entry > 0:
             size = min(size, round((balance * 0.25) / entry, 4))
         size = max(size, MIN_SIZE.get(epic, 1.0))
+
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
         body = {
@@ -169,8 +174,8 @@ class CapitalClient:
             "direction":      direction,
             "size":           size,
             "guaranteedStop": False,
-            "stopLevel":      round(sl, 4),
-            "profitLevel":    round(tp1, 4),
+            "stopLevel":      round(sl, 5),
+            "profitLevel":    round(tp1, 5),
         }
         try:
             resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
@@ -182,17 +187,41 @@ class CapitalClient:
                 except Exception:
                     detail = resp.text
                 logger.warning(
-                    f"[client] {symbol}: posicion rechazada (400) â "
+                    f"[client] {symbol}: posicion rechazada (400) — "
                     f"posiblemente mercado cerrado: {detail}"
                 )
                 return None
             raise
+
         data = resp.json()
         logger.info(
             f"[client] {symbol}: {direction} size={size} "
-            f"({pct*100:.1f}% balance={balance:.0f}) score={score} sl={sl} tp={tp1} - {data}"
+            f"({pct*100:.1f}% balance={balance:.0f}) sl={sl} tp={tp1} — {data}"
         )
         return data
+
+    def update_sl(self, deal_id, new_sl):
+        """
+        Mueve el Stop Loss de una posición abierta.
+        Usado por el trailing stop en main.py.
+        """
+        self.ensure_session()
+        url  = f"{BASE_URL}/api/v1/positions/{deal_id}"
+        body = {"stopLevel": round(new_sl, 5)}
+        try:
+            resp = requests.put(url, json=body, headers=self._headers(), timeout=15)
+            resp.raise_for_status()
+            logger.info(f"[client] Trailing SL actualizado deal={deal_id} new_sl={new_sl}")
+            return resp.json()
+        except requests.HTTPError:
+            if resp.status_code == 400:
+                try:
+                    detail = resp.json()
+                except Exception:
+                    detail = resp.text
+                logger.warning(f"[client] update_sl rechazado (400): {detail}")
+                return None
+            raise
 
     def close_position(self, deal_id):
         self.ensure_session()
