@@ -5,6 +5,10 @@ Descarga velas OHLCV de Capital.com:
 - 4H:    para el bias direccional (50 velas)
 
 Activos v3: alta volatilidad, separados del Bot Swing.
+
+Fix v4: rows.reverse() — la API de Capital.com devuelve velas en orden
+descendente (más nueva primero). Sin reverse, close[-1] era la vela más
+antigua (~25h atrás) en lugar de la más reciente.
 """
 
 import logging
@@ -60,6 +64,9 @@ def _fetch(epic, client, resolution, limit):
             "close":  _mid(p["closePrice"]),
             "volume": float(p.get("lastTradedVolume", 0) or 0),
         })
+    # Capital.com devuelve velas en orden DESCENDENTE (más nueva primero).
+    # Revertimos para que rows[-1] sea siempre la vela más reciente.
+    rows.reverse()
     return rows
 
 
