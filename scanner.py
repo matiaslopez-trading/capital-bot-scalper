@@ -1,16 +1,19 @@
 """
-scanner.py — Bot Scalper v4
-Estrategia: IFTRSI (Inverse Fisher Transform RSI) — matches TradingView IFTRSI_LB 14 9
+scanner.py — Bot Scalper v5
+Estrategia: RSI 14 plano + filtro de tendencia 4H (EMA20)
 
-Lógica:
-- LONG:  IFTRSI cruza hacia ARRIBA el umbral de oversold (-0.5)
-- SHORT: IFTRSI cruza hacia ABAJO el umbral de overbought (+0.5)
-- Bias 4H: en tendencia bajista exige IFTRSI más extremo para LONG
-            en tendencia alcista exige IFTRSI más extremo para SHORT
-- Exit thresholds: exportados para que main.py cierre anticipadamente
+Lógica de entrada:
+- LONG:  RSI cruza hacia ARRIBA el nivel 30 (sale de sobreventa)
+- SHORT: RSI cruza hacia ABAJO el nivel 70 (sale de sobrecompra)
 
-v4.1: Reversión desde zona extrema (REVERSAL_MIN=0.03)
-- Captura señales cuando IFTRSI está atascado en zona extrema y empieza a girar
+Filtro 4H bias (EMA20):
+- Tendencia alcista (bias=+1):  solo LONG permitido
+- Tendencia bajista (bias=-1):  solo SHORT permitido
+- Neutral (bias=0):             ambos permitidos (mean-reversion pura)
+
+Salida dinámica (en main.py):
+- Cerrar LONG cuando RSI >= 50
+- Cerrar SHORT cuando RSI <= 50
 """
 
 import logging
@@ -19,22 +22,18 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# IFTRSI — parámetros idénticos al indicador TradingView IFTRSI_LB 14 9
-RSI_LEN    = 14
-RSI_SMOOTH = 9     # EMA aplicada al RSI antes de la transformada
+# RSI parámetros
+RSI_LEN = 14
 
-# Umbrales estándar (mercado neutral)
-OB_STD = 0.5    # overbought — entrada SHORT / salida LONG
-OS_STD = -0.5   # oversold   — entrada LONG  / salida SHORT
-
-# Umbrales reforzados (contra tendencia)
-OB_STRONG = 0.7
-OS_STRONG = -0.7
+# Niveles RSI
+RSI_OS   = 30    # oversold  — entrada LONG
+RSI_OB   = 70    # overbought — entrada SHORT
+RSI_MID  = 50    # salida (exportado para main.py)
 
 # Multiplicadores SL/TP sobre ATR
 ATR_LEN     = 14
 ATR_MULT_SL = 2.0
-ATR_MULT_TP = 4.0   # R:R 2:1 — el exit dinámico reemplaza al TP en la práctica
+ATR_MULT_TP = 4.0
 
 COOLDOWN_VELAS = 3
 
@@ -50,7 +49,6 @@ CORRELATION_GROUPS = [
 def _ema(arr, period):
     k   = 2.0 / (period + 1)
     out = np.full(len(arr), np.nan, dtype=float)
-    # seed con el primer valor no-nan
     start = 0
     for i, v in enumerate(arr):
         if not np.isnan(v):
@@ -83,20 +81,6 @@ def _rsi_wilder(close, period=RSI_LEN):
     rs  = np.where(avg_l == 0, 100.0, avg_g / avg_l)
     rsi = 100.0 - 100.0 / (1 + rs)
     return np.concatenate([[np.nan], rsi])
-
-
-def _iftrsi(close, rsi_period=RSI_LEN, smooth=RSI_SMOOTH):
-    """
-    Inverse Fisher Transform del RSI.
-    Resultado oscila limpiamente entre -1 y +1.
-    Fórmula: IFT( EMA(RSI, smooth) )
-    """
-    rsi   = _rsi_wilder(close, rsi_period)
-    rsi_s = _ema(rsi, smooth)
-    x     = np.clip(0.1 * (rsi_s - 50), -10, 10)   # evitar overflow
-    exp2x = np.exp(2 * x)
-    ift   = (exp2x - 1) / (exp2x + 1)
-    return ift
 
 
 def _atr(high, low, close, period=ATR_LEN):
@@ -132,7 +116,7 @@ def _bias_4h(candles_4h):
 # ── lógica principal ───────────────────────────────────────────────────────────
 
 def _score_symbol(sym, candles_15m, candles_4h, regime=None):
-    # Necesitamos al menos 60 velas para RSI(14) + EMA(9) + algo de historia
+    # Necesitamos al menos 60 velas para RSI(14) + historia
     if not candles_15m or len(candles_15m) < 60:
         return None
 
@@ -140,14 +124,14 @@ def _score_symbol(sym, candles_15m, candles_4h, regime=None):
     high   = np.array([c["high"]   for c in candles_15m], dtype=float)
     low    = np.array([c["low"]    for c in candles_15m], dtype=float)
 
-    # ── IFTRSI ──────────────────────────────────────────────────────────────
-    ift = _iftrsi(close)
-    if np.isnan(ift[-1]) or np.isnan(ift[-2]):
-        logger.info(f"[scanner] {sym}: IFTRSI NaN — datos insuficientes")
+    # ── RSI 14 ──────────────────────────────────────────────────────────────
+    rsi = _rsi_wilder(close, RSI_LEN)
+    if np.isnan(rsi[-1]) or np.isnan(rsi[-2]):
+        logger.info(f"[scanner] {sym}: RSI NaN — datos insuficientes")
         return None
 
-    ift_curr = float(ift[-1])
-    ift_prev = float(ift[-2])
+    rsi_curr = float(rsi[-1])
+    rsi_prev = float(rsi[-2])
 
     # ── ATR para SL/TP ──────────────────────────────────────────────────────
     atr_arr = _atr(high, low, close, ATR_LEN)
@@ -157,39 +141,29 @@ def _score_symbol(sym, candles_15m, candles_4h, regime=None):
     # ── Bias 4H ─────────────────────────────────────────────────────────────
     bias = _bias_4h(candles_4h)
 
-    # ── Umbrales dinámicos según tendencia 4H ───────────────────────────────
-    if bias == -1:      # bajista
-        entry_long_thresh  = OS_STRONG   # -0.7
-        entry_short_thresh = OB_STD      # +0.5
-        exit_long_thresh   = 0.3
-        exit_short_thresh  = -0.5
-    elif bias == 1:     # alcista
-        entry_long_thresh  = OS_STD      # -0.5
-        entry_short_thresh = OB_STRONG   # +0.7
-        exit_long_thresh   = 0.5
-        exit_short_thresh  = -0.3
-    else:               # neutral
-        entry_long_thresh  = OS_STD      # -0.5
-        entry_short_thresh = OB_STD      # +0.5
-        exit_long_thresh   = OB_STD      # +0.5
-        exit_short_thresh  = OS_STD      # -0.5
-
     # ── Señal de entrada ─────────────────────────────────────────────────────
-    # 1) Cruce clásico del umbral (original)
-    # 2) Reversión desde zona extrema: IFTRSI atascado bajo/sobre el umbral
-    #    pero empieza a girar con fuerza (delta >= REVERSAL_MIN)
-    REVERSAL_MIN = 0.03
-
-    if ift_prev <= entry_long_thresh and ift_curr > entry_long_thresh:
-        signal = "LONG"    # cruce clásico
-    elif ift_curr <= entry_long_thresh and (ift_curr - ift_prev) >= REVERSAL_MIN:
-        signal = "LONG"    # reversión desde oversold sin cruzar aún
-    elif ift_prev >= entry_short_thresh and ift_curr < entry_short_thresh:
-        signal = "SHORT"   # cruce clásico
-    elif ift_curr >= entry_short_thresh and (ift_prev - ift_curr) >= REVERSAL_MIN:
-        signal = "SHORT"   # reversión desde overbought sin cruzar aún
+    # LONG:  RSI cruza >30 desde abajo (sale de sobreventa)
+    # SHORT: RSI cruza <70 desde arriba (sale de sobrecompra)
+    if rsi_prev <= RSI_OS and rsi_curr > RSI_OS:
+        raw_signal = "LONG"
+    elif rsi_prev >= RSI_OB and rsi_curr < RSI_OB:
+        raw_signal = "SHORT"
     else:
+        raw_signal = "ESPERAR"
+
+    # ── Filtro de tendencia 4H ───────────────────────────────────────────────
+    # Tendencia alcista: solo LONGs
+    # Tendencia bajista: solo SHORTs
+    # Neutral: ambos permitidos
+    filtro = None
+    if raw_signal == "LONG"  and bias == -1:
         signal = "ESPERAR"
+        filtro = "contra_tendencia_4H_bajista"
+    elif raw_signal == "SHORT" and bias == 1:
+        signal = "ESPERAR"
+        filtro = "contra_tendencia_4H_alcista"
+    else:
+        signal = raw_signal
 
     # ── SL / TP basados en ATR ───────────────────────────────────────────────
     if signal == "LONG" and atr_val > 0:
@@ -201,21 +175,23 @@ def _score_symbol(sym, candles_15m, candles_4h, regime=None):
     else:
         sl = tp1 = 0.0
 
-    return {
-        "signal":             signal,
-        "iftrsi":             round(ift_curr, 4),
-        "ift_prev":           round(ift_prev, 4),
-        "entry_long_thresh":  entry_long_thresh,
-        "entry_short_thresh": entry_short_thresh,
-        "exit_long_thresh":   exit_long_thresh,
-        "exit_short_thresh":  exit_short_thresh,
-        "entry":              last,
-        "sl":                 sl,
-        "tp1":                tp1,
-        "atr":                round(atr_val, 5),
-        "bias_4h":            bias,
-        "regime":             regime or "NEUTRAL",
+    result = {
+        "signal":     signal,
+        "raw_signal": raw_signal,
+        "rsi":        round(rsi_curr, 2),
+        "rsi_prev":   round(rsi_prev, 2),
+        "rsi_exit":   RSI_MID,        # main.py usa este valor para cerrar
+        "entry":      last,
+        "sl":         sl,
+        "tp1":        tp1,
+        "atr":        round(atr_val, 5),
+        "bias_4h":    bias,
+        "regime":     regime or "NEUTRAL",
     }
+    if filtro:
+        result["filtro"] = filtro
+
+    return result
 
 
 def run_scanner(data_15m, data_4h,
@@ -239,8 +215,8 @@ def run_scanner(data_15m, data_4h,
             res = _score_symbol(sym, candles, candles_4h, regime=regime)
             if res is None:
                 results[sym] = {
-                    "signal": "ESPERAR", "iftrsi": 0,
-                    "exit_long_thresh": 0.5, "exit_short_thresh": -0.5,
+                    "signal": "ESPERAR", "rsi": 0,
+                    "rsi_exit": RSI_MID,
                     "error": "datos_insuficientes",
                 }
                 continue
@@ -269,16 +245,17 @@ def run_scanner(data_15m, data_4h,
             results[sym] = res
             logger.info(
                 f"[scanner] {sym}: {res['signal']} "
-                f"IFTRSI={res['iftrsi']:+.3f} prev={res['ift_prev']:+.3f} "
+                f"RSI={res['rsi']:.1f} prev={res['rsi_prev']:.1f} "
                 f"bias4h={res['bias_4h']:+d} "
-                f"exit_L={res['exit_long_thresh']} exit_S={res['exit_short_thresh']}"
+                f"raw={res.get('raw_signal','?')} "
+                f"filtro={res.get('filtro','-')}"
             )
 
         except Exception as e:
             logger.error(f"[scanner] {sym}: {e}")
             results[sym] = {
-                "signal": "ESPERAR", "iftrsi": 0,
-                "exit_long_thresh": 0.5, "exit_short_thresh": -0.5,
+                "signal": "ESPERAR", "rsi": 0,
+                "rsi_exit": RSI_MID,
                 "error": str(e),
             }
 

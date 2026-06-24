@@ -1,14 +1,15 @@
 """
-main.py — Bot Scalper v4
+main.py — Bot Scalper v5
 Flask + APScheduler. Ciclo cada 5 minutos.
 9 activos en 15min con bias 4H.
 
-Cambios v4 vs v3:
-- Estrategia IFTRSI (reemplaza ADX/momentum)
-- Exit dinámico: cierra posición cuando IFTRSI llega al umbral de salida
-- Trailing stop: mueve SL a BE al 25% del camino al TP, luego protege 25% de ganancias
-- Sin regime_detector (eliminado)
-- score fijo = 2 para todas las entradas IFTRSI
+Cambios v5 vs v4:
+- Estrategia RSI 14 plano (reemplaza IFTRSI)
+- Entrada: RSI cruza >30 (LONG) o <70 (SHORT)
+- Exit dinámico: cierra posición cuando RSI llega a 50
+- Filtro 4H: tendencia alcista=solo LONG, bajista=solo SHORT, neutral=ambos
+- Trailing stop: se mantiene igual (BE al 25% TP, lock25% al 50% TP)
+- score fijo = 2 para todas las entradas
 """
 
 import os
@@ -65,11 +66,12 @@ def _now_utc():
 def _manage_open_positions(positions_api, signals):
     """
     Recorre las posiciones abiertas y aplica:
-    1. Exit dinámico por IFTRSI (salida antes de que invierta)
+    1. Exit dinámico por RSI=50 (salida cuando llega a la mitad del indicador)
     2. Trailing stop: BE al 25% del TP, luego +25% al 50% del TP
     """
     now = _now_utc()
 
+    # Mapa epic -> sym para lookups inversos
     from capital_client import SYMBOL_MAP
     epic_to_sym = {v: k for k, v in SYMBOL_MAP.items()}
 
@@ -87,33 +89,34 @@ def _manage_open_positions(positions_api, signals):
                 continue
 
             deal_id   = position.get("dealId", "")
-            direction = position.get("direction", "")
+            direction = position.get("direction", "")   # "BUY" o "SELL"
             pnl       = float(position.get("unrealisedPnl", 0) or 0)
             entry     = float(position.get("level", 0) or 0)
             sl        = float(position.get("stopLevel", 0) or 0)
             tp        = float(position.get("limitLevel", 0) or 0)
             size      = float(position.get("size", 0) or 0)
 
+            # Solo gestionamos posiciones que abrimos nosotros
             if own_pos_copy.get(sym) != deal_id:
                 continue
 
-            sig           = signals.get(sym, {})
-            iftrsi        = sig.get("iftrsi", 0)
-            exit_L_thresh = sig.get("exit_long_thresh", 0.5)
-            exit_S_thresh = sig.get("exit_short_thresh", -0.5)
+            # RSI actual de esta vela
+            sig      = signals.get(sym, {})
+            rsi_curr = sig.get("rsi", 50)
+            rsi_exit = sig.get("rsi_exit", 50)   # siempre 50
 
-            # ── 1. Exit dinámico por IFTRSI ───────────────────────────────
+            # ── 1. Exit dinámico por RSI=50 ───────────────────────────────
             should_exit = False
-            if direction == "BUY" and iftrsi >= exit_L_thresh:
+            if direction == "BUY"  and rsi_curr >= rsi_exit:
                 logger.info(
-                    f"[manage] {sym} LONG: IFTRSI={iftrsi:+.3f} >= exit_L={exit_L_thresh} "
-                    f"→ cerrando anticipadamente (PnL={pnl:+.2f})"
+                    f"[manage] {sym} LONG: RSI={rsi_curr:.1f} >= {rsi_exit} "
+                    f"→ cerrando por RSI medio (PnL={pnl:+.2f})"
                 )
                 should_exit = True
-            elif direction == "SELL" and iftrsi <= exit_S_thresh:
+            elif direction == "SELL" and rsi_curr <= rsi_exit:
                 logger.info(
-                    f"[manage] {sym} SHORT: IFTRSI={iftrsi:+.3f} <= exit_S={exit_S_thresh} "
-                    f"→ cerrando anticipadamente (PnL={pnl:+.2f})"
+                    f"[manage] {sym} SHORT: RSI={rsi_curr:.1f} <= {rsi_exit} "
+                    f"→ cerrando por RSI medio (PnL={pnl:+.2f})"
                 )
                 should_exit = True
 
@@ -134,41 +137,49 @@ def _manage_open_positions(positions_api, signals):
                             own_positions.pop(sym, None)
                         with trailing_state_lock:
                             trailing_state.pop(deal_id, None)
-                continue
+                    continue
 
             # ── 2. Trailing stop ───────────────────────────────────────────
+            # Solo si hay ganancia y tenemos SL y TP configurados
             if pnl <= 0 or entry <= 0 or sl <= 0 or tp <= 0 or size <= 0:
                 continue
 
-            tp_dist_price = abs(tp - entry)
+            tp_dist_price = abs(tp - entry)     # distancia total al TP en precio
             if tp_dist_price == 0:
                 continue
 
-            tp_usd = tp_dist_price * size
+            tp_usd = tp_dist_price * size        # ganancia máxima esperada en USD
 
             with trailing_state_lock:
                 ts = trailing_state.setdefault(deal_id, {"be_done": False, "lock25_done": False})
-                be_done     = ts["be_done"]
+                be_done    = ts["be_done"]
                 lock25_done = ts["lock25_done"]
 
-            # Nivel 1: al 25% del TP → mover SL a breakeven
+            # Nivel 1: al 25% del TP → mover SL a breakeven (+pequeño buffer)
             if not be_done and pnl >= tp_usd * 0.25:
                 if direction == "BUY":
+                    # BE = entry + 0.5% de buffer para evitar ruido
                     new_sl = round(entry * 1.001, 5)
                     if new_sl > sl:
                         result = client.update_sl(deal_id, new_sl)
                         if result is not None:
                             with trailing_state_lock:
                                 trailing_state[deal_id]["be_done"] = True
-                            logger.info(f"[manage] {sym} LONG trailing: BE → SL={new_sl}")
-                else:
+                            logger.info(
+                                f"[manage] {sym} LONG trailing: BE → SL={new_sl} "
+                                f"(PnL={pnl:+.2f} / TP_usd={tp_usd:.2f})"
+                            )
+                else:  # SELL
                     new_sl = round(entry * 0.999, 5)
                     if sl == 0 or new_sl < sl:
                         result = client.update_sl(deal_id, new_sl)
                         if result is not None:
                             with trailing_state_lock:
                                 trailing_state[deal_id]["be_done"] = True
-                            logger.info(f"[manage] {sym} SHORT trailing: BE → SL={new_sl}")
+                            logger.info(
+                                f"[manage] {sym} SHORT trailing: BE → SL={new_sl} "
+                                f"(PnL={pnl:+.2f} / TP_usd={tp_usd:.2f})"
+                            )
 
             # Nivel 2: al 50% del TP → bloquear 25% de ganancia
             if be_done and not lock25_done and pnl >= tp_usd * 0.50:
@@ -179,18 +190,24 @@ def _manage_open_positions(positions_api, signals):
                         if result is not None:
                             with trailing_state_lock:
                                 trailing_state[deal_id]["lock25_done"] = True
-                            logger.info(f"[manage] {sym} LONG trailing: lock25% → SL={new_sl}")
-                else:
+                            logger.info(
+                                f"[manage] {sym} LONG trailing: lock25% → SL={new_sl} "
+                                f"(PnL={pnl:+.2f} / TP_usd={tp_usd:.2f})"
+                            )
+                else:  # SELL
                     new_sl = round(entry - tp_dist_price * 0.25, 5)
                     if sl == 0 or new_sl < sl:
                         result = client.update_sl(deal_id, new_sl)
                         if result is not None:
                             with trailing_state_lock:
                                 trailing_state[deal_id]["lock25_done"] = True
-                            logger.info(f"[manage] {sym} SHORT trailing: lock25% → SL={new_sl}")
+                            logger.info(
+                                f"[manage] {sym} SHORT trailing: lock25% → SL={new_sl} "
+                                f"(PnL={pnl:+.2f} / TP_usd={tp_usd:.2f})"
+                            )
 
         except Exception as e:
-            logger.error(f"[manage] Error procesando posicion: {e}\n{traceback.format_exc()}")
+            logger.error(f"[manage] Error procesando posicion {pos}: {e}\n{traceback.format_exc()}")
 
 
 # ── Ciclo principal ────────────────────────────────────────────────────────────
@@ -198,6 +215,7 @@ def _manage_open_positions(positions_api, signals):
 def run_cycle():
     global last_scan_time
 
+    # Login si hace falta
     try:
         if not client.cst or not client.x_token:
             logger.info("[main] Re-login necesario...")
@@ -207,6 +225,7 @@ def run_cycle():
         logger.error(f"[main] Error en login: {e}")
         return
 
+    # Descargar datos 15m + 4H
     try:
         data_15m, data_4h = get_all_ohlcv(client)
     except Exception as e:
@@ -225,6 +244,7 @@ def run_cycle():
     with cooldown_until_lock:
         cd_snapshot = dict(cooldown_until)
 
+    # Escanear señales RSI
     try:
         results = run_scanner(
             data_15m, data_4h,
@@ -246,7 +266,7 @@ def run_cycle():
         if positions_api:
             _manage_open_positions(positions_api, results)
     except Exception as e:
-        logger.warning(f"[main] No se pudo gestionar posiciones: {e}")
+        logger.warning(f"[main] No se pudo obtener posiciones para gestionar: {e}")
 
     # ── Abrir nuevas posiciones ────────────────────────────────────────────────
     for sym, res in results.items():
@@ -267,7 +287,7 @@ def run_cycle():
                 entry = res.get("entry", 0)
                 sl    = res.get("sl", 0)
                 tp1   = res.get("tp1", 0)
-                score = 2  # IFTRSI crossover → score fijo
+                score = 2  # RSI crossover → score fijo
 
                 if entry and sl and tp1:
                     deal = client.open_position(
@@ -290,7 +310,7 @@ def run_cycle():
                         logger.info(
                             f"[main] {sym}: {signal} @ {entry} "
                             f"SL={sl} TP={tp1} ATR={res.get('atr','?')} "
-                            f"IFTRSI={res.get('iftrsi','?')} bias4h={res.get('bias_4h','?')} "
+                            f"RSI={res.get('rsi','?')} bias4h={res.get('bias_4h','?')} "
                             f"deal={deal_id}"
                         )
                     else:
@@ -357,7 +377,7 @@ def health():
         ts_copy = dict(trailing_state)
     return jsonify({
         "status":             "ok",
-        "bot":                "Bot Scalper v4 (IFTRSI)",
+        "bot":                "Bot Scalper v5 (RSI14)",
         "activos":            9,
         "last_scan":          last_scan_time,
         "signals":            n,
@@ -379,11 +399,11 @@ def signals():
     with trailing_state_lock:
         ts_copy = dict(trailing_state)
     return jsonify({
-        "last_scan":      last_scan_time,
-        "signals":        state_copy,
-        "errors":         scan_errors,
-        "own_positions":  pos_copy,
-        "cooldowns":      cd_copy,
+        "last_scan":     last_scan_time,
+        "signals":       state_copy,
+        "errors":        scan_errors,
+        "own_positions": pos_copy,
+        "cooldowns":     cd_copy,
         "trailing_state": ts_copy,
     }), 200
 
@@ -416,7 +436,7 @@ def stats():
         with trailing_state_lock:
             ts_copy = dict(trailing_state)
         return jsonify({
-            "bot":            "Bot Scalper v4 (IFTRSI)",
+            "bot":            "Bot Scalper v5 (RSI14)",
             "own_positions":  pos_copy,
             "trailing_state": ts_copy,
             "positions":      positions,
