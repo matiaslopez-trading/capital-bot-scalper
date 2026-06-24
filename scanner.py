@@ -8,6 +8,9 @@ Lógica:
 - Bias 4H: en tendencia bajista exige IFTRSI más extremo para LONG
             en tendencia alcista exige IFTRSI más extremo para SHORT
 - Exit thresholds: exportados para que main.py cierre anticipadamente
+
+v4.1: Reversión desde zona extrema (REVERSAL_MIN=0.03)
+- Captura señales cuando IFTRSI está atascado en zona extrema y empieza a girar
 """
 
 import logging
@@ -155,27 +158,36 @@ def _score_symbol(sym, candles_15m, candles_4h, regime=None):
     bias = _bias_4h(candles_4h)
 
     # ── Umbrales dinámicos según tendencia 4H ───────────────────────────────
-    if bias == -1:
-        entry_long_thresh  = OS_STRONG
-        entry_short_thresh = OB_STD
+    if bias == -1:      # bajista
+        entry_long_thresh  = OS_STRONG   # -0.7
+        entry_short_thresh = OB_STD      # +0.5
         exit_long_thresh   = 0.3
         exit_short_thresh  = -0.5
-    elif bias == 1:
-        entry_long_thresh  = OS_STD
-        entry_short_thresh = OB_STRONG
+    elif bias == 1:     # alcista
+        entry_long_thresh  = OS_STD      # -0.5
+        entry_short_thresh = OB_STRONG   # +0.7
         exit_long_thresh   = 0.5
         exit_short_thresh  = -0.3
-    else:
-        entry_long_thresh  = OS_STD
-        entry_short_thresh = OB_STD
-        exit_long_thresh   = OB_STD
-        exit_short_thresh  = OS_STD
+    else:               # neutral
+        entry_long_thresh  = OS_STD      # -0.5
+        entry_short_thresh = OB_STD      # +0.5
+        exit_long_thresh   = OB_STD      # +0.5
+        exit_short_thresh  = OS_STD      # -0.5
 
-    # ── Señal de entrada: cruce del umbral ───────────────────────────────────
+    # ── Señal de entrada ─────────────────────────────────────────────────────
+    # 1) Cruce clásico del umbral (original)
+    # 2) Reversión desde zona extrema: IFTRSI atascado bajo/sobre el umbral
+    #    pero empieza a girar con fuerza (delta >= REVERSAL_MIN)
+    REVERSAL_MIN = 0.03
+
     if ift_prev <= entry_long_thresh and ift_curr > entry_long_thresh:
-        signal = "LONG"
+        signal = "LONG"    # cruce clásico
+    elif ift_curr <= entry_long_thresh and (ift_curr - ift_prev) >= REVERSAL_MIN:
+        signal = "LONG"    # reversión desde oversold sin cruzar aún
     elif ift_prev >= entry_short_thresh and ift_curr < entry_short_thresh:
-        signal = "SHORT"
+        signal = "SHORT"   # cruce clásico
+    elif ift_curr >= entry_short_thresh and (ift_prev - ift_curr) >= REVERSAL_MIN:
+        signal = "SHORT"   # reversión desde overbought sin cruzar aún
     else:
         signal = "ESPERAR"
 
