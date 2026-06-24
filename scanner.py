@@ -1,63 +1,31 @@
 """
-scanner.py — Bot Scalper v6
-Estrategia: RSI 14 con bandas adaptativas por régimen 4H
-
-Lógica de entrada (preparada para plata real):
-  4H alcista  → solo LONG:
-      - RSI tocó <=45 en las últimas 6 velas (pullback válido)
-      - RSI cruza hacia arriba el nivel 50 (momentum confirmado)
-      - La vela actual cierra en verde (close > open)
-
-  4H bajista  → solo SHORT:
-      - RSI tocó >=55 en las últimas 6 velas (rally válido)
-      - RSI cruza hacia abajo el nivel 50 (momentum confirmado)
-      - La vela actual cierra en rojo (close < open)
-
-  4H neutral  → ambos (mean-reversion):
-      - LONG:  RSI cruza >35 con vela verde
-      - SHORT: RSI cruza <65 con vela roja
-
-Lógica de salida (main.py):
-  LONG:  RSI >= 70 (TP) | RSI cruza <50 (momentum fade) | 10 velas (time-stop)
-  SHORT: RSI <= 30 (TP) | RSI cruza >50 (momentum fade) | 10 velas (time-stop)
-  Neutral LONG:  RSI >= 65 | RSI cruza <50 | 10 velas
-  Neutral SHORT: RSI <= 35 | RSI cruza >50 | 10 velas
-
-SL: ATR x2 (sin cambios)
-TP: ATR x4 (sin cambios, como límite máximo en la plataforma)
+scanner.py - Bot Scalper v6
+RSI adaptativo por regimen 4H con pullback validation y candle confirmation.
 """
-
 import logging
 import numpy as np
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-# ── Parámetros RSI ─────────────────────────────────────────────────────────────
-RSI_LEN = 14
-
-# Niveles por régimen
-BULL_DIP_LEVEL       = 45    # RSI debe haber tocado <=45 en el pullback
-BULL_TRIGGER         = 50    # cruce alcista de 50 = entrada LONG
-BULL_TP_RSI          = 70    # salida LONG en tendencia alcista
-BEAR_RALLY_LEVEL     = 55    # RSI debe haber tocado >=55 en el rally
-BEAR_TRIGGER         = 50    # cruce bajista de 50 = entrada SHORT
-BEAR_TP_RSI          = 30    # salida SHORT en tendencia bajista
-NEUTRAL_LONG_TRIG    = 35    # cruce alcista de 35 = LONG neutral
-NEUTRAL_SHORT_TRIG   = 65    # cruce bajista de 65 = SHORT neutral
-NEUTRAL_LONG_TP      = 65    # salida LONG neutral
-NEUTRAL_SHORT_TP     = 35    # salida SHORT neutral
-MOMENTUM_FADE_LEVEL  = 50    # nivel de cierre anticipado por pérdida de momentum
-PULLBACK_LOOKBACK    = 6     # velas hacia atrás para validar pullback/rally
-
-# ── Parámetros SL/TP ATR ───────────────────────────────────────────────────────
-ATR_LEN     = 14
-ATR_MULT_SL = 2.0
-ATR_MULT_TP = 4.0    # límite máximo en plataforma; la salida real es por RSI
-
-# ── Otros ──────────────────────────────────────────────────────────────────────
-COOLDOWN_VELAS = 3
-TIME_STOP_BARS = 10  # cerrar posición si tras 10 velas (150 min) no llegó a TP/SL
+RSI_LEN              = 14
+BULL_DIP_LEVEL       = 45
+BULL_TRIGGER         = 50
+BULL_TP_RSI          = 70
+BEAR_RALLY_LEVEL     = 55
+BEAR_TRIGGER         = 50
+BEAR_TP_RSI          = 30
+NEUTRAL_LONG_TRIG    = 35
+NEUTRAL_SHORT_TRIG   = 65
+NEUTRAL_LONG_TP      = 65
+NEUTRAL_SHORT_TP     = 35
+MOMENTUM_FADE_LEVEL  = 50
+PULLBACK_LOOKBACK    = 6
+ATR_LEN              = 14
+ATR_MULT_SL          = 2.0
+ATR_MULT_TP          = 4.0
+COOLDOWN_VELAS       = 3
+TIME_STOP_BARS       = 10
 
 CORRELATION_GROUPS = [
     {"DOGEUSD", "XRPUSD", "SOLUSD"},
@@ -66,16 +34,14 @@ CORRELATION_GROUPS = [
 ]
 
 
-# ── Helpers matemáticos ────────────────────────────────────────────────────────
-
 def _ema(arr, period):
-    k   = 2.0 / (period + 1)
+    k = 2.0 / (period + 1)
     out = np.full(len(arr), np.nan, dtype=float)
     start = 0
     for i, v in enumerate(arr):
         if not np.isnan(v):
             out[i] = v
-            start  = i + 1
+            start = i + 1
             break
     for i in range(start, len(arr)):
         prev = out[i - 1]
@@ -89,10 +55,9 @@ def _ema(arr, period):
 
 
 def _rsi_wilder(close, period=RSI_LEN):
-    """RSI con suavizado de Wilder — idéntico a TradingView / Capital.com."""
     delta = np.diff(close.astype(float))
-    gain  = np.where(delta > 0, delta, 0.0)
-    loss  = np.where(delta < 0, -delta, 0.0)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
     avg_g = np.full(len(gain), np.nan)
     avg_l = np.full(len(loss), np.nan)
     if period <= len(gain):
@@ -101,7 +66,7 @@ def _rsi_wilder(close, period=RSI_LEN):
         for i in range(period, len(gain)):
             avg_g[i] = (avg_g[i - 1] * (period - 1) + gain[i]) / period
             avg_l[i] = (avg_l[i - 1] * (period - 1) + loss[i]) / period
-    rs  = np.where(avg_l == 0, 100.0, avg_g / avg_l)
+    rs = np.where(avg_l == 0, 100.0, avg_g / avg_l)
     rsi = 100.0 - 100.0 / (1 + rs)
     return np.concatenate([[np.nan], rsi])
 
@@ -110,7 +75,7 @@ def _atr(high, low, close, period=ATR_LEN):
     tr = np.maximum(
         high[1:] - low[1:],
         np.maximum(np.abs(high[1:] - close[:-1]),
-                   np.abs(low[1:]  - close[:-1]))
+                   np.abs(low[1:] - close[:-1]))
     )
     atr = np.full(len(close), np.nan)
     if period < len(tr):
@@ -121,23 +86,18 @@ def _atr(high, low, close, period=ATR_LEN):
 
 
 def _classify_4h_regime(candles_4h):
-    """
-    Régimen basado en EMA20 4H + pendiente de la EMA.
-    Retorna: 'bullish' | 'bearish' | 'neutral'
-    """
     if not candles_4h or len(candles_4h) < 25:
         return "neutral"
     close = np.array([c["close"] for c in candles_4h], dtype=float)
     ema20 = _ema(close, 20)
     last_close = close[-1]
-    last_ema   = ema20[-1]
+    last_ema = ema20[-1]
     if np.isnan(last_ema) or last_ema == 0:
         return "neutral"
     dist = (last_close - last_ema) / last_ema
-    # Pendiente: EMA ahora vs hace 3 velas
-    slope_up   = ema20[-1] > ema20[-4] if len(ema20) >= 4 else False
+    slope_up = ema20[-1] > ema20[-4] if len(ema20) >= 4 else False
     slope_down = ema20[-1] < ema20[-4] if len(ema20) >= 4 else False
-    NEUTRAL_BUFFER = 0.001   # ±0.1%
+    NEUTRAL_BUFFER = 0.001
     if dist > NEUTRAL_BUFFER and slope_up:
         return "bullish"
     if dist < -NEUTRAL_BUFFER and slope_down:
@@ -145,18 +105,15 @@ def _classify_4h_regime(candles_4h):
     return "neutral"
 
 
-# ── Lógica principal ───────────────────────────────────────────────────────────
-
 def _score_symbol(sym, candles_15m, candles_4h):
     if not candles_15m or len(candles_15m) < 60:
         return None
 
     close = np.array([c["close"] for c in candles_15m], dtype=float)
-    open_ = np.array([c["open"]  for c in candles_15m], dtype=float)
-    high  = np.array([c["high"]  for c in candles_15m], dtype=float)
-    low   = np.array([c["low"]   for c in candles_15m], dtype=float)
+    open_ = np.array([c["open"] for c in candles_15m], dtype=float)
+    high = np.array([c["high"] for c in candles_15m], dtype=float)
+    low = np.array([c["low"] for c in candles_15m], dtype=float)
 
-    # ── RSI Wilder ───────────────────────────────────────────────────────────
     rsi = _rsi_wilder(close, RSI_LEN)
     if np.isnan(rsi[-1]) or np.isnan(rsi[-2]):
         return None
@@ -164,54 +121,141 @@ def _score_symbol(sym, candles_15m, candles_4h):
     rsi_curr = float(rsi[-1])
     rsi_prev = float(rsi[-2])
 
-    # ── ATR ──────────────────────────────────────────────────────────────────
     atr_arr = _atr(high, low, close, ATR_LEN)
     atr_val = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
-    last    = float(close[-1])
+    last = float(close[-1])
 
-    # ── Confirmación de vela ─────────────────────────────────────────────────
-    green_candle = close[-1] > open_[-1]   # cierre > apertura
-    red_candle   = close[-1] < open_[-1]
+    green_candle = close[-1] > open_[-1]
+    red_candle = close[-1] < open_[-1]
 
-    # ── Régimen 4H ───────────────────────────────────────────────────────────
     regime = _classify_4h_regime(candles_4h)
 
-    # ── RSI de las últimas PULLBACK_LOOKBACK velas (sin la actual) ───────────
     lookback_start = -(PULLBACK_LOOKBACK + 1)
     recent_rsi = rsi[lookback_start:-1]
     recent_rsi_valid = recent_rsi[~np.isnan(recent_rsi)]
 
-    # ── Señal de entrada ─────────────────────────────────────────────────────
-    signal    = "ESPERAR"
-    long_tp   = BULL_TP_RSI
-    short_tp  = BEAR_TP_RSI
-    filtro    = None
+    signal = "ESPERAR"
+    long_tp = BULL_TP_RSI
+    short_tp = BEAR_TP_RSI
+    filtro = None
 
     if regime == "bullish":
-        long_tp  = BULL_TP_RSI      # 70
-        short_tp = BULL_TP_RSI      # no aplica, solo LONG
+        long_tp = BULL_TP_RSI
+        short_tp = BULL_TP_RSI
         had_pullback = len(recent_rsi_valid) > 0 and np.any(recent_rsi_valid <= BULL_DIP_LEVEL)
-        crossed_up   = rsi_prev < BULL_TRIGGER and rsi_curr >= BULL_TRIGGER
+        crossed_up = rsi_prev < BULL_TRIGGER and rsi_curr >= BULL_TRIGGER
         if had_pullback and crossed_up and green_candle:
             signal = "LONG"
         elif not had_pullback and crossed_up:
             filtro = "sin_pullback_previo"
         elif not crossed_up:
-            filtro = f"RSI_no_cruzo_50 (curr={rsi_curr:.1f})"
+            filtro = "RSI_no_cruzo_50_curr={:.1f}".format(rsi_curr)
 
     elif regime == "bearish":
-        long_tp  = BEAR_TP_RSI      # no aplica, solo SHORT
-        short_tp = BEAR_TP_RSI      # 30
-        had_rally  = len(recent_rsi_valid) > 0 and np.any(recent_rsi_valid >= BEAR_RALLY_LEVEL)
+        long_tp = BEAR_TP_RSI
+        short_tp = BEAR_TP_RSI
+        had_rally = len(recent_rsi_valid) > 0 and np.any(recent_rsi_valid >= BEAR_RALLY_LEVEL)
         crossed_dn = rsi_prev > BEAR_TRIGGER and rsi_curr <= BEAR_TRIGGER
         if had_rally and crossed_dn and red_candle:
             signal = "SHORT"
         elif not had_rally and crossed_dn:
             filtro = "sin_rally_previo"
         elif not crossed_dn:
-            filtro = f"RSI_no_cruzo_50 (curr={rsi_curr:.1f})"
+            filtro = "RSI_no_cruzo_50_curr={:.1f}".format(rsi_curr)
 
-    else:  # neutral
-        long_tp  = NEUTRAL_LONG_TP   # 65
-        short_tp = NEUTRAL_SHORT_TP  # 35
-        if rsi_prev < NEUTRAL_LONG_TRIG and 
+    else:
+        long_tp = NEUTRAL_LONG_TP
+        short_tp = NEUTRAL_SHORT_TP
+        if rsi_prev < NEUTRAL_LONG_TRIG and rsi_curr >= NEUTRAL_LONG_TRIG and green_candle:
+            signal = "LONG"
+        elif rsi_prev > NEUTRAL_SHORT_TRIG and rsi_curr <= NEUTRAL_SHORT_TRIG and red_candle:
+            signal = "SHORT"
+
+    if signal == "LONG" and atr_val > 0:
+        sl = round(last - atr_val * ATR_MULT_SL, 5)
+        tp1 = round(last + atr_val * ATR_MULT_TP, 5)
+    elif signal == "SHORT" and atr_val > 0:
+        sl = round(last + atr_val * ATR_MULT_SL, 5)
+        tp1 = round(last - atr_val * ATR_MULT_TP, 5)
+    else:
+        sl = tp1 = 0.0
+
+    result = {
+        "signal": signal,
+        "rsi": round(rsi_curr, 2),
+        "rsi_prev": round(rsi_prev, 2),
+        "regime": regime,
+        "long_tp_rsi": long_tp,
+        "short_tp_rsi": short_tp,
+        "momentum_fade_level": MOMENTUM_FADE_LEVEL,
+        "entry": last,
+        "sl": sl,
+        "tp1": tp1,
+        "atr": round(atr_val, 5),
+        "green_candle": green_candle,
+    }
+    if filtro:
+        result["filtro"] = filtro
+    return result
+
+
+def run_scanner(data_15m, data_4h, open_positions=None, cooldown_until=None, regimes=None):
+    if open_positions is None:
+        open_positions = set()
+    if cooldown_until is None:
+        cooldown_until = {}
+
+    now = datetime.now(timezone.utc)
+    results = {}
+
+    for sym, candles in data_15m.items():
+        candles_4h = (data_4h or {}).get(sym)
+        try:
+            res = _score_symbol(sym, candles, candles_4h)
+            if res is None:
+                results[sym] = {
+                    "signal": "ESPERAR", "rsi": 0, "regime": "neutral",
+                    "long_tp_rsi": BULL_TP_RSI, "short_tp_rsi": BEAR_TP_RSI,
+                    "momentum_fade_level": MOMENTUM_FADE_LEVEL,
+                    "error": "datos_insuficientes",
+                }
+                continue
+
+            if res["signal"] in ("LONG", "SHORT"):
+                cd = cooldown_until.get(sym)
+                if cd and now < cd:
+                    remaining = int((cd - now).total_seconds() / 60)
+                    res["signal"] = "ESPERAR"
+                    res["filtro"] = "cooldown:{}min".format(remaining)
+
+            if res["signal"] in ("LONG", "SHORT") and sym in open_positions:
+                res["signal"] = "ESPERAR"
+                res["filtro"] = "ya_abierto"
+
+            if res["signal"] in ("LONG", "SHORT"):
+                for grupo in CORRELATION_GROUPS:
+                    if sym in grupo:
+                        bloq = grupo & open_positions
+                        if bloq:
+                            res["signal"] = "ESPERAR"
+                            res["filtro"] = "correlacion:{}".format(bloq)
+                            break
+
+            results[sym] = res
+            logger.info(
+                "[scanner] {}: {} | RSI={:.1f} prev={:.1f} | regime={} | filtro={}".format(
+                    sym, res["signal"], res["rsi"], res["rsi_prev"],
+                    res["regime"], res.get("filtro", "-")
+                )
+            )
+
+        except Exception as e:
+            logger.error("[scanner] {}: {}".format(sym, e))
+            results[sym] = {
+                "signal": "ESPERAR", "rsi": 0, "regime": "neutral",
+                "long_tp_rsi": BULL_TP_RSI, "short_tp_rsi": BEAR_TP_RSI,
+                "momentum_fade_level": MOMENTUM_FADE_LEVEL,
+                "error": str(e),
+            }
+
+    return results
