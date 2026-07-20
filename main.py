@@ -1,6 +1,10 @@
 """
-main.py — Bot Scalper v7
-Flask + APScheduler. Ciclo cada 5 minutos, velas de 5 minutos.
+main.py — Bot Scalper v7.1
+Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
+de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
+formación en vez de esperar a que cierre. Esto reduce la latencia de
+reacción sin achicar el ATR (y por lo tanto sin que el spread se coma
+una porción mayor de cada operación, como sí pasaría usando velas de 1min).
 9 activos, mean-reversion pura (sin filtro de tendencia 4H).
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
@@ -321,9 +325,12 @@ def start_scheduler():
     logger.info("[main] Login confirmado. Lanzando primer ciclo...")
     threading.Thread(target=run_cycle, daemon=True).start()
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(run_cycle, "interval", minutes=5, id="scalper_cycle")
+    # Ciclo cada 1 minuto: reacciona a la vela de 5min en formacion sin
+    # esperar a que cierre. El RSI/ATR siguen calculados sobre velas de
+    # 5min (CANDLE_MINUTES no cambia) - solo se reduce la latencia de reaccion.
+    scheduler.add_job(run_cycle, "interval", minutes=1, id="scalper_cycle")
     scheduler.start()
-    logger.info("[main] Scheduler activo - ciclo cada 5 minutos (velas de 5min).")
+    logger.info("[main] Scheduler activo - ciclo cada 1 minuto (RSI en velas de 5min).")
 
 
 @app.after_request
