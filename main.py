@@ -134,10 +134,17 @@ def _manage_open_positions(positions_api, signals):
                 continue
 
             position = live["position"]
-            pnl      = float(position.get("unrealisedPnl", 0) or 0)
+            # v7.3b FIX: la API de Capital.com devuelve el PnL no realizado
+            # en el campo "upl" (no "unrealisedPnl") y el TP en "profitLevel"
+            # (no "limitLevel"). Con los nombres viejos, pnl y tp SIEMPRE se
+            # leian como 0 -> el techo de PnL fijo nunca se disparaba y el
+            # breakeven trailing tampoco (por eso se acumularon 4 posiciones
+            # de AMZN sin gestionar). Se mantiene el nombre viejo como
+            # fallback por si la API cambia el shape en el futuro.
+            pnl      = float(position.get("upl", position.get("unrealisedPnl", 0)) or 0)
             entry    = float(position.get("level", 0) or 0)
             sl       = float(position.get("stopLevel", 0) or 0)
-            tp       = float(position.get("limitLevel", 0) or 0)
+            tp       = float(position.get("profitLevel", position.get("limitLevel", 0)) or 0)
             size     = float(position.get("size", 0) or 0)
 
             should_exit = False
@@ -348,6 +355,58 @@ def run_cycle():
             logger.info(f"[main] {s}: cooldown vencido")
 
 
+def _reconcile_positions():
+    """
+    v7.3b: al reiniciar (cada redeploy en Railway), own_positions arranca
+    vacio en memoria, pero las posiciones siguen abiertas en Capital.com.
+    Sin esto, el bot pierde el rastro y puede seguir abriendo posiciones
+    nuevas del mismo simbolo sin respetar MAX_POS_PER_SYM (paso lo que
+    causo 4 posiciones de AMZN abiertas a la vez el 20/07). Al arrancar,
+    se importan las posiciones ya abiertas que correspondan a un simbolo
+    del Scalper.
+    """
+    from capital_client import SYMBOL_MAP
+    epic_to_sym = {v: k for k, v in SYMBOL_MAP.items()}
+    try:
+        positions_api = client.get_positions()
+    except Exception as e:
+        logger.error(f"[reconcile] No se pudo leer posiciones: {e}")
+        return
+    imported = 0
+    for pos in positions_api or []:
+        epic = pos.get("market", {}).get("epic")
+        sym  = epic_to_sym.get(epic)
+        if not sym:
+            continue  # posicion de otro bot (ej. Bot Swing) - se ignora
+        position = pos.get("position", {})
+        deal_id  = position.get("dealId")
+        if not deal_id:
+            continue
+        created_str = position.get("createdDateUTC")
+        try:
+            open_time = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            if open_time.tzinfo is None:
+                open_time = open_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            open_time = _now_utc()
+        with own_positions_lock:
+            existing = own_positions.setdefault(sym, [])
+            if any(e["deal_id"] == deal_id for e in existing):
+                continue
+            existing.append({
+                "deal_id":   deal_id,
+                "direction": position.get("direction", "BUY"),
+                "open_time": open_time,
+                "entry":     float(position.get("level", 0) or 0),
+                "be_done":   False,
+            })
+        imported += 1
+    if imported:
+        logger.warning(f"[reconcile] {imported} posicion(es) importadas desde Capital.com al arrancar.")
+    else:
+        logger.info("[reconcile] Sin posiciones huerfanas para importar.")
+
+
 def start_scheduler():
     retries = 0
     while not client.cst and retries < 10:
@@ -357,7 +416,9 @@ def start_scheduler():
     if not client.cst:
         logger.error("[main] Login fallido. Scheduler no iniciado.")
         return
-    logger.info("[main] Login confirmado. Lanzando primer ciclo...")
+    logger.info("[main] Login confirmado. Reconciliando posiciones...")
+    _reconcile_positions()
+    logger.info("[main] Lanzando primer ciclo...")
     threading.Thread(target=run_cycle, daemon=True).start()
     scheduler = BackgroundScheduler(daemon=True)
     # Ciclo cada 1 minuto: reacciona a la vela de 5min en formacion sin
