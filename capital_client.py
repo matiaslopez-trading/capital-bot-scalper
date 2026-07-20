@@ -36,6 +36,14 @@ SYMBOL_MAP = {
 # operaciones chicas, no pocas operaciones grandes)
 PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
+# v7.3d: exposicion (notional) maxima permitida por operacion, como % del
+# balance. Protege cuentas chicas: algunos activos (ej. US100, GBPJPY)
+# tienen un tamaño minimo de Capital.com que representa una exposicion
+# desproporcionada si el balance es bajo (con $1000, el minimo de US100
+# ya son ~$2800 de exposicion). Si el minimo obligatorio de la plataforma
+# supera este %, la operacion se aborta en vez de forzarla.
+MAX_EXPOSURE_PCT = 0.10
+
 # Tamaño mínimo Capital.com
 MIN_SIZE = {
     "US100":   0.1,
@@ -166,6 +174,23 @@ class CapitalClient:
         if entry > 0:
             size = min(size, round((balance * 0.15) / entry, 4))
         size = max(size, MIN_SIZE.get(epic, 1.0))
+
+        # v7.3d: guardrail de exposicion maxima. El paso anterior puede
+        # haber forzado size hacia arriba (MIN_SIZE de la plataforma) por
+        # encima del cap de 15% recien aplicado. Si la exposicion final
+        # (size x precio) supera MAX_EXPOSURE_PCT del balance, se aborta
+        # en vez de abrir una posicion desproporcionada para la cuenta.
+        exposure = size * entry if entry > 0 else 0
+        max_exposure = balance * MAX_EXPOSURE_PCT
+        if exposure > max_exposure:
+            logger.warning(
+                f"[client] {symbol}: operacion abortada - tamaño mínimo de la "
+                f"plataforma ({size}) implica exposición ${exposure:.2f}, "
+                f"por encima del {MAX_EXPOSURE_PCT*100:.0f}% del balance "
+                f"(${max_exposure:.2f} con balance=${balance:.2f}). "
+                f"Activo no operable con este capital."
+            )
+            return None
 
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
