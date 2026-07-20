@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.3
+main.py — Bot Scalper v7.4
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -17,6 +17,12 @@ o a -FIXED_SL_USD, se cierra al instante. El SL/TP nativo de Capital.com
 (ATR based) queda como respaldo de emergencia únicamente (por si el bot
 se cae o Railway reinicia entre ciclos) — en operación normal, el cierre
 por PnL fijo dispara primero casi siempre.
+
+v7.4 (20/07/2026): panel manual on/off en GET /panel (boton) y POST
+/panel/toggle. Pausar deja de abrir posiciones NUEVAS pero sigue
+gestionando/cerrando las que ya estaban abiertas. Pensado para que
+Matias pueda apagarlo antes de dormir sin dejar operaciones sueltas.
+El estado vive en memoria (se resetea a activo en cada redeploy).
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -68,6 +74,14 @@ own_positions_lock = threading.Lock()
 
 cooldown_until      = {}
 cooldown_until_lock = threading.Lock()
+
+# v7.4: interruptor manual on/off. Cuando esta en False, el bot deja de
+# ABRIR posiciones nuevas, pero sigue gestionando (cerrando por +-$2,
+# RSI o time-stop) las que ya estaban abiertas - para que Matias pueda
+# apagarlo antes de dormir sin dejar operaciones sueltas sin vigilar.
+# Vive solo en memoria: si Railway redeploya, vuelve a quedar en True.
+trading_enabled      = True
+trading_enabled_lock = threading.Lock()
 
 
 def _now_utc():
@@ -283,6 +297,12 @@ def run_cycle():
     except Exception as e:
         logger.warning(f"[main] No se pudo gestionar posiciones: {e}")
 
+    with trading_enabled_lock:
+        puede_abrir = trading_enabled
+    if not puede_abrir:
+        logger.info("[main] Trading pausado manualmente - no se abren posiciones nuevas (se siguen gestionando las existentes).")
+        return
+
     now = _now_utc()
     for sym, res in results.items():
         if sym not in valid_syms:
@@ -446,6 +466,8 @@ def health():
         total_pos = sum(len(v) for v in pos_copy.values())
     with cooldown_until_lock:
         cd_copy = {s: t.isoformat() for s, t in cooldown_until.items()}
+    with trading_enabled_lock:
+        habilitado = trading_enabled
     return jsonify({
         "status":             "ok",
         "bot":                "Bot Scalper v7 (mean-reversion 5min, alto volumen)",
@@ -455,9 +477,67 @@ def health():
         "own_positions":      pos_copy,
         "total_posiciones":   total_pos,
         "cooldowns":          cd_copy,
-        "trading_habilitado": True,
+        "trading_habilitado": habilitado,
         "cuenta":             "DEMO (dinero ficticio)",
     }), 200
+
+
+@app.route("/panel", methods=["GET"])
+def panel():
+    """
+    v7.4: panel simple con un boton para pausar/reanudar la apertura de
+    posiciones nuevas (ej. antes de dormir). Cuando esta pausado, el bot
+    sigue gestionando y cerrando lo que ya tenia abierto (por +-$2, RSI
+    o time-stop) - solo deja de abrir posiciones nuevas.
+    """
+    with trading_enabled_lock:
+        habilitado = trading_enabled
+    with own_positions_lock:
+        total_pos = sum(len(v) for v in own_positions.values())
+    color  = "#1f9d55" if habilitado else "#c53030"
+    texto  = "ACTIVO — abriendo operaciones" if habilitado else "PAUSADO — no abre operaciones nuevas"
+    accion = "pausar" if habilitado else "reanudar"
+    boton_txt = "Pausar bot" if habilitado else "Reanudar bot"
+    html = f"""
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Bot Scalper — Panel</title>
+      <style>
+        body {{ font-family: -apple-system, sans-serif; background:#111; color:#eee;
+               display:flex; flex-direction:column; align-items:center; padding:40px 16px; }}
+        .estado {{ font-size: 20px; font-weight: bold; color: {color}; margin-bottom: 24px; }}
+        .info {{ color:#aaa; margin-bottom: 24px; }}
+        button {{ font-size: 18px; padding: 16px 32px; border-radius: 10px; border: none;
+                  background: {color}; color: white; font-weight: bold; }}
+      </style>
+    </head>
+    <body>
+      <h2>Bot Scalper</h2>
+      <div class="estado">{texto}</div>
+      <div class="info">Posiciones abiertas ahora: {total_pos}</div>
+      <form method="POST" action="/panel/toggle">
+        <button type="submit">{boton_txt}</button>
+      </form>
+      <p class="info" style="margin-top:24px;">
+        Al pausar, el bot NO abre operaciones nuevas, pero sigue cerrando
+        las que ya tenía abiertas (por +/-$2, RSI o time-stop).
+      </p>
+    </body>
+    </html>
+    """
+    return html, 200
+
+
+@app.route("/panel/toggle", methods=["POST", "GET"])
+def panel_toggle():
+    global trading_enabled
+    with trading_enabled_lock:
+        trading_enabled = not trading_enabled
+        nuevo = trading_enabled
+    logger.warning(f"[main] Trading {'REANUDADO' if nuevo else 'PAUSADO'} manualmente via /panel/toggle.")
+    from flask import redirect
+    return redirect("/panel", code=303)
 
 
 @app.route("/signals", methods=["GET"])
