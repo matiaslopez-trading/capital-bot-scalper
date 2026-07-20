@@ -1,14 +1,10 @@
 """
-data_feed.py — Bot Scalper v3
-Descarga velas OHLCV de Capital.com:
-- 15min: para el scanner (100 velas)
-- 4H:    para el bias direccional (50 velas)
+data_feed.py — Bot Scalper v7
+Descarga velas de 5 minutos de Capital.com (confirmado: la API soporta
+resolution=MINUTE_5 sin restricciones de cuenta demo/real).
 
-Activos v3: alta volatilidad, separados del Bot Swing.
-
-Fix v4: rows.reverse() — la API de Capital.com devuelve velas en orden
-descendente (más nueva primero). Sin reverse, close[-1] era la vela más
-antigua (~25h atrás) en lugar de la más reciente.
+v7 elimina el fetch de 4H — ya no hay filtro de tendencia superior.
+El scalper opera mean-reversion pura en ambas direcciones.
 """
 
 import logging
@@ -18,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://demo-api-capital.backend-capital.com"
 
-# 9 activos del Bot Scalper v3 — alta volatilidad, distintos al Swing
+# 9 activos del Bot Scalper — universo separado del Bot Swing (no se pisan)
 CAPITAL_EPICS = {
     "US100":   "US100",
     "GBPJPY":  "GBPJPY",
@@ -64,35 +60,23 @@ def _fetch(epic, client, resolution, limit):
             "close":  _mid(p["closePrice"]),
             "volume": float(p.get("lastTradedVolume", 0) or 0),
         })
-    # Capital.com devuelve velas en orden DESCENDENTE (más nueva primero).
-    # Revertimos para que rows[-1] sea siempre la vela más reciente.
-    rows.reverse()
     return rows
 
 
 def get_all_ohlcv(client):
     """
-    Descarga velas 15min y 4H para los 9 activos.
-    Retorna:
-        data_15m: { sym: [candles] | None }
-        data_4h:  { sym: [candles] | None }
+    Descarga velas de 5 minutos para los 9 activos del scalper.
+    100 velas = ~8.3 horas de historia, suficiente para RSI(14) y ATR(14).
+    Retorna: data_5m: { sym: [candles] | None }
     """
-    data_15m = {}
-    data_4h  = {}
+    data_5m = {}
 
     for sym, epic in CAPITAL_EPICS.items():
         try:
-            data_15m[sym] = _fetch(epic, client, "MINUTE_15", 100)
-            logger.info(f"[data_feed] {sym} 15m: {len(data_15m[sym])} velas OK")
+            data_5m[sym] = _fetch(epic, client, "MINUTE_5", 100)
+            logger.info(f"[data_feed] {sym} 5m: {len(data_5m[sym])} velas OK")
         except Exception as e:
-            logger.warning(f"[data_feed] {sym} 15m: ERROR — {e}")
-            data_15m[sym] = None
+            logger.warning(f"[data_feed] {sym} 5m: ERROR — {e}")
+            data_5m[sym] = None
 
-        try:
-            data_4h[sym] = _fetch(epic, client, "HOUR_4", 50)
-            logger.info(f"[data_feed] {sym} 4H: {len(data_4h[sym])} velas OK")
-        except Exception as e:
-            logger.warning(f"[data_feed] {sym} 4H: ERROR — {e}")
-            data_4h[sym] = None
-
-    return data_15m, data_4h
+    return data_5m

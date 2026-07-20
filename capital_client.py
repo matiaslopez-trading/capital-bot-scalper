@@ -1,8 +1,11 @@
 """
-capital_client.py
-Cliente para la API REST de Capital.com (modo demo) — Bot Scalper v4.
-Cambios v4:
-- Agrega update_sl(deal_id, new_sl) para trailing stop dinámico
+capital_client.py — Bot Scalper v7
+Cliente para la API REST de Capital.com (modo demo, dinero ficticio).
+
+Cambios v7:
+- Se elimina el bloqueo automático de "posición ya abierta" en open_position():
+  ahora el bot puede tener hasta 2 posiciones simultáneas por símbolo
+  (el control de cuántas hay abiertas lo lleva main.py con own_positions).
 """
 
 import os
@@ -16,7 +19,7 @@ logger = logging.getLogger(__name__)
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540
 
-# Activos v4: mismos 9 del scalper v3
+# Activos del Scalper v7 — mismo universo que v3-v6, separado del Bot Swing
 SYMBOL_MAP = {
     "US100":   "US100",
     "GBPJPY":  "GBPJPY",
@@ -29,8 +32,9 @@ SYMBOL_MAP = {
     "MSFT":    "MSFT",
 }
 
-# % del balance a arriesgar según score (score fijo 2 para IFTRSI)
-PCT_POR_SCORE = {2: 0.02, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
+# % del balance a arriesgar por operación (score fijo 2 en v7: muchas
+# operaciones chicas, no pocas operaciones grandes)
+PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
 # Tamaño mínimo Capital.com
 MIN_SIZE = {
@@ -136,25 +140,20 @@ class CapitalClient:
         return all_activities
 
     def open_position(self, symbol, action, entry, sl, tp1, score=2, sizing_mult=1.0):
+        """
+        v7: ya NO bloquea automáticamente si hay una posición abierta en el
+        mismo símbolo — el límite de 2 posiciones simultáneas lo controla
+        main.py antes de llamar a esta función.
+        """
         epic = SYMBOL_MAP.get(symbol)
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
             return None
 
-        # Verificar posición ya abierta
-        try:
-            positions = self.get_positions()
-            for p in positions:
-                if p.get("market", {}).get("epic") == epic:
-                    logger.info(f"[client] {symbol}: ya tiene posicion abierta, omitiendo")
-                    return None
-        except Exception as e:
-            logger.warning(f"[client] {symbol}: no se pudo verificar posiciones: {e}")
-
         direction = "BUY" if action == "LONG" else "SELL"
 
-        # Sizing correcto: arriesgar risk_usd exactos sobre la distancia al SL
-        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.02) * sizing_mult
+        # Sizing: arriesgar risk_usd exactos sobre la distancia al SL
+        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.015) * sizing_mult
         balance  = self.get_balance()
         risk_usd = balance * pct
         sl_dist  = abs(entry - sl) if sl and sl != entry else 0
@@ -162,9 +161,10 @@ class CapitalClient:
             size = round(risk_usd / sl_dist, 4)
         else:
             size = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        # Cap: no más del 25% del balance en margen por posición
+        # Cap: no más del 15% del balance en margen por posición individual
+        # (más bajo que antes porque ahora puede haber 2 posiciones por activo)
         if entry > 0:
-            size = min(size, round((balance * 0.25) / entry, 4))
+            size = min(size, round((balance * 0.15) / entry, 4))
         size = max(size, MIN_SIZE.get(epic, 1.0))
 
         self.ensure_session()
@@ -193,18 +193,32 @@ class CapitalClient:
                 return None
             raise
 
-        data = resp.json()
+        data     = resp.json()
+        deal_ref = data.get("dealReference")
+
+        # El POST /positions sólo devuelve dealReference, no el dealId real.
+        # Hay que confirmarlo — si no, close_position()/update_sl() fallan con 400.
+        deal_id = None
+        if deal_ref:
+            try:
+                conf_url  = f"{BASE_URL}/api/v1/confirms/{deal_ref}"
+                conf_resp = requests.get(conf_url, headers=self._headers(), timeout=10)
+                conf_resp.raise_for_status()
+                conf = conf_resp.json()
+                deal_id = conf.get("dealId") or conf.get("affectedDeals", [{}])[0].get("dealId")
+            except Exception as e:
+                logger.warning(f"[client] {symbol}: no se pudo confirmar dealId — {e}")
+
+        data["dealId"] = deal_id
         logger.info(
             f"[client] {symbol}: {direction} size={size} "
-            f"({pct*100:.1f}% balance={balance:.0f}) sl={sl} tp={tp1} — {data}"
+            f"({pct*100:.1f}% balance={balance:.0f}) sl={sl} tp={tp1} "
+            f"dealId={deal_id} — {data}"
         )
         return data
 
     def update_sl(self, deal_id, new_sl):
-        """
-        Mueve el Stop Loss de una posición abierta.
-        Usado por el trailing stop en main.py.
-        """
+        """Mueve el Stop Loss de una posición abierta (trailing stop)."""
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions/{deal_id}"
         body = {"stopLevel": round(new_sl, 5)}
