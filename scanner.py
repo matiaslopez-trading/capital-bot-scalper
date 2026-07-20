@@ -1,6 +1,13 @@
 """
-scanner.py — Bot Scalper v7
+scanner.py — Bot Scalper v7.2
 Estrategia: mean-reversion pura en velas de 5 minutos.
+
+v7.2 (20/07/2026): fix critico — ahora se descarta siempre la ultima
+vela del array antes de calcular indicadores, porque con polling cada
+1 minuto esa vela suele estar todavia formandose y su RSI fluctua por
+ruido, no por señal real. El 20/07 esto causo 170 operaciones en un dia
+con 28% de aciertos y -$673 netos (ver CSV de la cuenta). Ahora solo se
+opera sobre velas de 5min ya cerradas.
 
 Objetivo: MUCHAS operaciones de calidad por día (no pocas con R:R alto).
 Sin filtro de tendencia superior — opera LONG y SHORT indistintamente,
@@ -126,8 +133,19 @@ def _is_bearish_engulfing(o_prev, c_prev, o_curr, c_curr):
 # ── Lógica principal ──────────────────────────────────────────────────────
 
 def _score_symbol(sym, candles_5m):
-    if not candles_5m or len(candles_5m) < 40:
+    if not candles_5m or len(candles_5m) < 41:
         return None
+
+    # v7.2 FIX: descartar la última vela — con polling cada 1 minuto pero
+    # velas de 5 minutos, la última vela del array suele estar todavia
+    # formandose. Su precio (y por lo tanto el RSI) fluctua constantemente
+    # mientras se arma, generando cruces de 30/70 por ruido momentaneo en
+    # vez de por una señal real. Esto causaba entradas y salidas en
+    # segundos (170 operaciones/dia, 28% de aciertos, -$673 netos el
+    # 20/07/2026). Al usar solo velas YA CERRADAS, el RSI deja de
+    # parpadear. Seguimos consultando cada 1 min para reaccionar rapido
+    # apenas una vela cierra de verdad, pero ya no operamos sobre ruido.
+    candles_5m = candles_5m[:-1]
 
     close = np.array([c["close"] for c in candles_5m], dtype=float)
     open_ = np.array([c["open"]  for c in candles_5m], dtype=float)
