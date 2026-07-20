@@ -291,6 +291,17 @@ def run_cycle():
                 if n_abiertas >= MAX_POS_PER_SYM:
                     continue
 
+            # v7.3: el cooldown se calcula ANTES de gestionar posiciones
+            # (cd_snapshot), asi que si esta misma posicion se acaba de
+            # cerrar arriba en _manage_open_positions() (por el nuevo TP/SL
+            # fijo, por RSI o por time-stop), el snapshot todavia no lo
+            # reflejaba y el simbolo podria reabrirse en el acto. Chequeo
+            # el cooldown en vivo aca para evitar reentrar sin descanso.
+            with cooldown_until_lock:
+                cd_live = cooldown_until.get(sym)
+            if cd_live and now < cd_live:
+                continue
+
             entry = res.get("entry", 0)
             sl    = res.get("sl", 0)
             tp1   = res.get("tp1", 0)
