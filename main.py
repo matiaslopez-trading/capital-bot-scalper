@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.1
+main.py — Bot Scalper v7.3
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -7,10 +7,20 @@ reacción sin achicar el ATR (y por lo tanto sin que el spread se coma
 una porción mayor de cada operación, como sí pasaría usando velas de 1min).
 9 activos, mean-reversion pura (sin filtro de tendencia 4H).
 
+v7.3 (20/07/2026): salida por PnL fijo en dólares. Analizando el CSV de
+170 operaciones del 20/07 se vio que la pérdida promedio (-$7.73) fue
+bastante mayor que la ganancia promedio ($5.62) — el SL nativo (ATR)
+deja correr las pérdidas mucho más que lo que se deja correr a las
+ganancias antes de un early-exit. Ahora, en cada ciclo (cada 1 min) se
+chequea el PnL no realizado de cada posición: si llega a +FIXED_TP_USD
+o a -FIXED_SL_USD, se cierra al instante. El SL/TP nativo de Capital.com
+(ATR based) queda como respaldo de emergencia únicamente (por si el bot
+se cae o Railway reinicia entre ciclos) — en operación normal, el cierre
+por PnL fijo dispara primero casi siempre.
+
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
-desaciertos. R:R cercano a 1:1 (ATR SLx1.0 / TPx1.3), hasta 2 posiciones
-simultáneas por activo.
+desaciertos. Hasta 2 posiciones simultáneas por activo.
 
 Cuenta DEMO — dinero ficticio.
 """
@@ -41,6 +51,10 @@ client = CapitalClient()
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 5)
 CANDLE_MINUTES    = 5
+
+# v7.3: techo de PnL fijo en dolares por operacion (ver docstring arriba)
+FIXED_TP_USD = 2.0
+FIXED_SL_USD = 2.0
 
 scanner_state  = {}
 scanner_lock   = threading.Lock()
@@ -129,7 +143,17 @@ def _manage_open_positions(positions_api, signals):
             should_exit = False
             exit_reason = ""
 
-            if bars >= TIME_STOP_BARS:
+            # v7.3: prioridad maxima - techo de PnL fijo en dolares.
+            # Se chequea primero porque es el criterio de salida principal;
+            # el resto (time-stop, RSI neutral) son fallback para posiciones
+            # que quedan flotando sin tocar ninguno de los dos techos.
+            if pnl >= FIXED_TP_USD:
+                should_exit = True
+                exit_reason = f"TP fijo (${pnl:.2f} >= ${FIXED_TP_USD:.2f})"
+            elif pnl <= -FIXED_SL_USD:
+                should_exit = True
+                exit_reason = f"SL fijo (${pnl:.2f} <= -${FIXED_SL_USD:.2f})"
+            elif bars >= TIME_STOP_BARS:
                 should_exit = True
                 exit_reason = f"time-stop ({bars} velas / {bars*CANDLE_MINUTES}min)"
 
