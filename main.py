@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.5
+main.py — Bot Scalper v7.6
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -35,6 +35,11 @@ basado en hace cuanto corrio el ultimo scan, gauge de RSI 0-100 por
 activo con las zonas de sobrecompra/sobreventa marcadas, y el mismo
 boton de pausar/reanudar que /panel.
 
+v7.6 (20/07/2026): el dashboard suma al Bot Swing (via /swing-proxy,
+lectura server-side de su endpoint publico - repos y deploys siguen
+100% separados) y agrega numeros de escala (0/30/70/100) debajo de
+cada gauge de RSI.
+
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
 desaciertos. Hasta 2 posiciones simultáneas por activo.
@@ -48,6 +53,7 @@ import logging
 import threading
 import traceback
 import time
+import requests
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
@@ -55,6 +61,11 @@ from capital_client import CapitalClient
 from apscheduler.schedulers.background import BackgroundScheduler
 from data_feed import get_all_ohlcv, CAPITAL_EPICS
 from scanner import run_scanner, COOLDOWN_VELAS, TIME_STOP_BARS, MAX_POS_PER_SYM
+
+# v7.6: URL publica del Bot Swing (repo y deploy 100% separados - solo se
+# lee su endpoint publico de solo-lectura para mostrarlo en el dashboard,
+# nunca se llama nada que module su trading).
+SWING_BASE_URL = "https://capital-bot-production-1cc5.up.railway.app"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -577,12 +588,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
            background: linear-gradient(to right, #e74c3c 0%, #e74c3c 30%, #2a2f3d 30%, #2a2f3d 70%, #2ecc71 70%, #2ecc71 100%);
            margin-bottom:8px; }
   .marker { position:absolute; top:-4px; width:4px; height:18px; background:#fff; border-radius:2px; }
+  .scale { position:relative; height:14px; font-size:9px; color:#666; margin-bottom:8px; }
+  .scale span { position:absolute; transform:translateX(-50%); }
   .signal { font-size:13px; font-weight:bold; }
   .signal-LONG { color:#2ecc71; }
   .signal-SHORT { color:#e74c3c; }
   .signal-ESPERAR { color:#777; }
+  .trend { font-size:11px; color:#888; margin-top:2px; }
   .filtro { font-size:11px; color:#666; margin-top:4px; }
   h2 { font-size:15px; color:#ccc; margin: 24px 0 10px; }
+  .subtitle { font-size:11px; color:#666; margin: -6px 0 12px; }
   .pos-card { background:#161b26; border-radius:12px; padding:14px; margin-bottom:10px; border:1px solid #232a3a; }
   .pos-top { display:flex; justify-content:space-between; align-items:center; }
   .pnl { font-weight:bold; font-size:15px; }
@@ -603,11 +618,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button id="toggleBtn" onclick="toggleTrading()">...</button>
   </div>
 
-  <h2>Activos - RSI en vivo (5min)</h2>
+  <h2>Bot Scalper - RSI en vivo (5min)</h2>
   <div class="grid" id="assetsGrid"></div>
 
-  <h2>Posiciones abiertas</h2>
+  <h2>Bot Scalper - Posiciones abiertas</h2>
   <div id="positionsList"><div class="empty">Cargando...</div></div>
+
+  <h2>Bot Swing - RSI en vivo (diario)</h2>
+  <div class="subtitle" id="swingStatus">Cargando...</div>
+  <div class="grid" id="swingGrid"></div>
 
   <div class="updated" id="updated"></div>
 
@@ -687,29 +706,71 @@ function distanciaTexto(rsi) {
   return 'en zona de sobrecompra';
 }
 
+const SCALE_HTML =
+  '<div class="scale">' +
+  '<span style="left:0%">0</span>' +
+  '<span style="left:30%">30</span>' +
+  '<span style="left:70%">70</span>' +
+  '<span style="left:100%">100</span>' +
+  '</div>';
+
+function buildAssetCard(sym, s) {
+  const rsi = (s.rsi !== undefined && s.rsi !== null) ? s.rsi : null;
+  const markerLeft = rsi !== null ? Math.max(0, Math.min(100, rsi)) : 50;
+  const rsiTxt = rsi !== null ? rsi.toFixed(1) : '-';
+  const sig = s.signal || 'ESPERAR';
+  const card = document.createElement('div');
+  card.className = 'card';
+  let extra = '';
+  if (s.trend) extra += '<div class="trend">tendencia: ' + s.trend + '</div>';
+  if (s.filtro) extra += '<div class="filtro">' + s.filtro + '</div>';
+  if (s.error) extra += '<div class="filtro">error: ' + s.error + '</div>';
+  card.innerHTML =
+    '<div class="sym">' + sym + '</div>' +
+    '<div class="rsi-val">RSI ' + rsiTxt + '<br>' + distanciaTexto(rsi) + '</div>' +
+    '<div class="gauge"><div class="marker" style="left:calc(' + markerLeft + '% - 2px)"></div></div>' +
+    SCALE_HTML +
+    '<div class="signal signal-' + sig + '">' + sig + '</div>' +
+    extra;
+  return card;
+}
+
 function renderAssets(signals) {
   const grid = document.getElementById('assetsGrid');
   grid.innerHTML = '';
   const sigs = signals.signals || {};
   const syms = Object.keys(sigs).sort();
   for (const sym of syms) {
-    const s = sigs[sym];
-    const rsi = (s.rsi !== undefined && s.rsi !== null) ? s.rsi : null;
-    const markerLeft = rsi !== null ? Math.max(0, Math.min(100, rsi)) : 50;
-    const rsiTxt = rsi !== null ? rsi.toFixed(1) : '-';
-    const sig = s.signal || 'ESPERAR';
-    const card = document.createElement('div');
-    card.className = 'card';
-    let extra = '';
-    if (s.filtro) extra = '<div class="filtro">' + s.filtro + '</div>';
-    if (s.error) extra = '<div class="filtro">error: ' + s.error + '</div>';
-    card.innerHTML =
-      '<div class="sym">' + sym + '</div>' +
-      '<div class="rsi-val">RSI ' + rsiTxt + '<br>' + distanciaTexto(rsi) + '</div>' +
-      '<div class="gauge"><div class="marker" style="left:calc(' + markerLeft + '% - 2px)"></div></div>' +
-      '<div class="signal signal-' + sig + '">' + sig + '</div>' +
-      extra;
-    grid.appendChild(card);
+    grid.appendChild(buildAssetCard(sym, sigs[sym]));
+  }
+}
+
+async function fetchSwing() {
+  const statusEl = document.getElementById('swingStatus');
+  const grid = document.getElementById('swingGrid');
+  try {
+    const res = await fetch('/swing-proxy');
+    const data = await res.json();
+    if (data.health && data.health.error) {
+      statusEl.innerText = 'Bot Swing no responde (' + data.health.error + ')';
+      return;
+    }
+    const secAgo = timeAgoSec(data.signals && data.signals.last_scan);
+    if (secAgo === null) {
+      statusEl.innerText = 'Sin datos del Bot Swing todavia';
+    } else if (secAgo < 20 * 60) {
+      statusEl.innerText = 'Funcionando bien - ultimo scan hace ' + Math.round(secAgo / 60) + ' min (revisa cada 15 min)';
+    } else {
+      statusEl.innerText = 'POSIBLE FALLA - ultimo scan hace ' + Math.round(secAgo / 60) + ' min';
+    }
+    grid.innerHTML = '';
+    const sigs = (data.signals && data.signals.signals) || {};
+    const syms = Object.keys(sigs).sort();
+    for (const sym of syms) {
+      grid.appendChild(buildAssetCard(sym, sigs[sym]));
+    }
+  } catch (e) {
+    statusEl.innerText = 'Error consultando al Bot Swing';
   }
 }
 
@@ -754,8 +815,10 @@ async function toggleTrading() {
 
 fetchFast();
 fetchSlow();
+fetchSwing();
 setInterval(fetchFast, 5000);
 setInterval(fetchSlow, 20000);
+setInterval(fetchSwing, 30000);
 </script>
 </body>
 </html>
@@ -765,6 +828,28 @@ setInterval(fetchSlow, 20000);
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     return DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+@app.route("/swing-proxy", methods=["GET"])
+def swing_proxy():
+    """
+    v7.6: el dashboard tambien muestra al Bot Swing. Como corre en otro
+    servicio de Railway (dominio distinto) y no expone headers CORS, un
+    fetch() directo desde el navegador quedaria bloqueado por el
+    navegador (Same-Origin Policy). Se pide server-side (Python -> Python,
+    sin CORS de por medio) y se reenvia tal cual al frontend. Solo lectura
+    de endpoints publicos de status - nunca se llama nada que module el
+    trading del Bot Swing, se respeta la separacion total entre bots.
+    """
+    try:
+        health = requests.get(f"{SWING_BASE_URL}/", timeout=8).json()
+    except Exception as e:
+        health = {"error": str(e)}
+    try:
+        signals = requests.get(f"{SWING_BASE_URL}/signals", timeout=8).json()
+    except Exception as e:
+        signals = {"error": str(e)}
+    return jsonify({"health": health, "signals": signals}), 200
 
 
 @app.route("/signals", methods=["GET"])
