@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.6
+main.py — Bot Scalper v7.7
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -39,6 +39,15 @@ v7.6 (20/07/2026): el dashboard suma al Bot Swing (via /swing-proxy,
 lectura server-side de su endpoint publico - repos y deploys siguen
 100% separados) y agrega numeros de escala (0/30/70/100) debajo de
 cada gauge de RSI.
+
+v7.7 (20/07/2026): dashboard reorganizado en dos bloques (Bot Scalper
+arriba, Bot Swing abajo), cada uno con su lista de activos en filas
+compactas en vez de tarjetas sueltas, y su propia seccion de
+posiciones abiertas. El tracking interno del Bot Swing (own_positions)
+pierde el rastro de sus posiciones en cada redeploy - las posiciones
+del Swing que se muestran ahora se derivan de la cuenta compartida de
+Capital.com (via /swing-proxy), filtrando por epics que no pertenecen
+al universo de activos del Scalper.
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -580,33 +589,47 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   button { font-size:14px; padding:10px 18px; border-radius:8px; border:none; font-weight:bold; cursor:pointer; }
   .btn-pause { background:#c53030; color:white; }
   .btn-resume { background:#1f9d55; color:white; }
-  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:12px; margin-bottom:24px; }
-  .card { background:#161b26; border-radius:12px; padding:14px; border:1px solid #232a3a; }
-  .sym { font-weight:bold; font-size:15px; margin-bottom:6px; }
-  .rsi-val { font-size:12px; color:#999; margin-bottom:8px; min-height:32px; }
-  .gauge { position:relative; height:10px; border-radius:5px;
-           background: linear-gradient(to right, #e74c3c 0%, #e74c3c 30%, #2a2f3d 30%, #2a2f3d 70%, #2ecc71 70%, #2ecc71 100%);
-           margin-bottom:8px; }
-  .marker { position:absolute; top:-4px; width:4px; height:18px; background:#fff; border-radius:2px; }
-  .scale { position:relative; height:14px; font-size:9px; color:#666; margin-bottom:8px; }
+
+  .bloque { background:#10131c; border:1px solid #1e2430; border-radius:14px; padding:16px; margin-bottom:20px; }
+  .bloque-header { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:4px; }
+  .bloque-title { font-size:17px; font-weight:bold; color:#fff; }
+  .bloque-sub { font-size:11px; color:#666; margin-bottom:14px; }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#667; margin:16px 0 8px; }
+
+  .list { display:flex; flex-direction:column; gap:6px; }
+  .row { display:flex; align-items:center; gap:14px; background:#161b26; border:1px solid #232a3a;
+         border-radius:8px; padding:10px 14px; flex-wrap:wrap; }
+  .row-sym { font-weight:bold; font-size:14px; width:66px; flex-shrink:0; }
+  .row-rsi { font-size:13px; color:#ccc; width:44px; flex-shrink:0; }
+  .row-gauge-wrap { flex:1 1 160px; min-width:140px; }
+  .row-dist { font-size:10px; color:#777; margin-top:3px; }
+  .row-signal { width:76px; flex-shrink:0; font-size:12px; font-weight:bold; text-align:center;
+                border-radius:6px; padding:4px 0; }
+  .row-note { font-size:11px; color:#666; flex-basis:100%; margin-top:2px; margin-left:80px; }
+
+  .gauge { position:relative; height:8px; border-radius:4px;
+           background: linear-gradient(to right, #e74c3c 0%, #e74c3c 30%, #2a2f3d 30%, #2a2f3d 70%, #2ecc71 70%, #2ecc71 100%); }
+  .marker { position:absolute; top:-3px; width:3px; height:14px; background:#fff; border-radius:2px; }
+  .scale { position:relative; height:12px; font-size:9px; color:#666; margin-top:2px; }
   .scale span { position:absolute; transform:translateX(-50%); }
-  .signal { font-size:13px; font-weight:bold; }
-  .signal-LONG { color:#2ecc71; }
-  .signal-SHORT { color:#e74c3c; }
-  .signal-ESPERAR { color:#777; }
-  .trend { font-size:11px; color:#888; margin-top:2px; }
-  .filtro { font-size:11px; color:#666; margin-top:4px; }
-  h2 { font-size:15px; color:#ccc; margin: 24px 0 10px; }
-  .subtitle { font-size:11px; color:#666; margin: -6px 0 12px; }
-  .pos-card { background:#161b26; border-radius:12px; padding:14px; margin-bottom:10px; border:1px solid #232a3a; }
-  .pos-top { display:flex; justify-content:space-between; align-items:center; }
-  .pnl { font-weight:bold; font-size:15px; }
+
+  .signal-LONG { color:#0b0e14; background:#2ecc71; }
+  .signal-SHORT { color:#0b0e14; background:#e74c3c; }
+  .signal-ESPERAR { color:#888; background:transparent; }
+
+  .prow { display:flex; align-items:center; gap:14px; background:#161b26; border:1px solid #232a3a;
+          border-radius:8px; padding:10px 14px; flex-wrap:wrap; margin-bottom:6px; }
+  .prow-sym { font-weight:bold; font-size:14px; width:110px; flex-shrink:0; }
+  .prow-info { font-size:11px; color:#888; width:170px; flex-shrink:0; }
+  .prow-bar-wrap { flex:1 1 140px; min-width:120px; }
+  .pnl { font-weight:bold; font-size:14px; width:90px; flex-shrink:0; text-align:right; }
   .pnl-pos { color:#2ecc71; }
   .pnl-neg { color:#e74c3c; }
-  .pos-bar { position:relative; height:10px; border-radius:5px; background:#2a2f3d; margin-top:10px; overflow:hidden; }
+  .pos-bar { position:relative; height:8px; border-radius:4px; background:#2a2f3d; overflow:hidden; }
   .pos-fill { position:absolute; height:100%; top:0; }
+
   .empty { color:#666; font-size:13px; }
-  .updated { font-size:11px; color:#555; text-align:right; margin-top:20px; }
+  .updated { font-size:11px; color:#555; text-align:right; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -618,15 +641,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button id="toggleBtn" onclick="toggleTrading()">...</button>
   </div>
 
-  <h2>Bot Scalper - RSI en vivo (5min)</h2>
-  <div class="grid" id="assetsGrid"></div>
+  <div class="bloque">
+    <div class="bloque-header"><div class="bloque-title">Bot Scalper</div></div>
+    <div class="bloque-sub">Velas de 5 min - mean reversion RSI</div>
+    <h3>Activos</h3>
+    <div class="list" id="assetsList"></div>
+    <h3>Posiciones abiertas</h3>
+    <div class="list" id="positionsList"><div class="empty">Cargando...</div></div>
+  </div>
 
-  <h2>Bot Scalper - Posiciones abiertas</h2>
-  <div id="positionsList"><div class="empty">Cargando...</div></div>
-
-  <h2>Bot Swing - RSI en vivo (diario)</h2>
-  <div class="subtitle" id="swingStatus">Cargando...</div>
-  <div class="grid" id="swingGrid"></div>
+  <div class="bloque">
+    <div class="bloque-header"><div class="bloque-title">Bot Swing</div></div>
+    <div class="bloque-sub" id="swingStatus">Cargando...</div>
+    <h3>Activos</h3>
+    <div class="list" id="swingList"></div>
+    <h3>Posiciones abiertas</h3>
+    <div class="list" id="swingPositionsList"><div class="empty">Cargando...</div></div>
+  </div>
 
   <div class="updated" id="updated"></div>
 
@@ -639,8 +670,9 @@ async function fetchFast() {
     const health = await healthRes.json();
     const signals = await signalsRes.json();
     renderHealth(health);
-    renderAssets(signals);
-    renderPositions(signals, health);
+    renderAssetsList('assetsList', signals.signals || {});
+    renderScalperPositions(signals);
+    document.getElementById('updated').innerText = 'Actualizado ' + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById('statusText').innerText = 'Error de conexion con el bot';
     document.getElementById('dot').className = 'dot bad';
@@ -714,40 +746,80 @@ const SCALE_HTML =
   '<span style="left:100%">100</span>' +
   '</div>';
 
-function buildAssetCard(sym, s) {
+function buildAssetRow(sym, s) {
   const rsi = (s.rsi !== undefined && s.rsi !== null) ? s.rsi : null;
   const markerLeft = rsi !== null ? Math.max(0, Math.min(100, rsi)) : 50;
   const rsiTxt = rsi !== null ? rsi.toFixed(1) : '-';
   const sig = s.signal || 'ESPERAR';
-  const card = document.createElement('div');
-  card.className = 'card';
-  let extra = '';
-  if (s.trend) extra += '<div class="trend">tendencia: ' + s.trend + '</div>';
-  if (s.filtro) extra += '<div class="filtro">' + s.filtro + '</div>';
-  if (s.error) extra += '<div class="filtro">error: ' + s.error + '</div>';
-  card.innerHTML =
-    '<div class="sym">' + sym + '</div>' +
-    '<div class="rsi-val">RSI ' + rsiTxt + '<br>' + distanciaTexto(rsi) + '</div>' +
-    '<div class="gauge"><div class="marker" style="left:calc(' + markerLeft + '% - 2px)"></div></div>' +
-    SCALE_HTML +
-    '<div class="signal signal-' + sig + '">' + sig + '</div>' +
-    extra;
-  return card;
+  const row = document.createElement('div');
+  row.className = 'row';
+  let nota = '';
+  if (s.trend) nota += 'tendencia: ' + s.trend + '. ';
+  if (s.filtro) nota += s.filtro;
+  if (s.error) nota += 'error: ' + s.error;
+  row.innerHTML =
+    '<div class="row-sym">' + sym + '</div>' +
+    '<div class="row-rsi">RSI ' + rsiTxt + '</div>' +
+    '<div class="row-gauge-wrap">' +
+      '<div class="gauge"><div class="marker" style="left:calc(' + markerLeft + '% - 2px)"></div></div>' +
+      SCALE_HTML +
+      '<div class="row-dist">' + distanciaTexto(rsi) + '</div>' +
+    '</div>' +
+    '<div class="row-signal signal-' + sig + '">' + sig + '</div>' +
+    (nota ? '<div class="row-note">' + nota + '</div>' : '');
+  return row;
 }
 
-function renderAssets(signals) {
-  const grid = document.getElementById('assetsGrid');
-  grid.innerHTML = '';
-  const sigs = signals.signals || {};
+function renderAssetsList(containerId, sigs) {
+  const list = document.getElementById(containerId);
+  list.innerHTML = '';
   const syms = Object.keys(sigs).sort();
   for (const sym of syms) {
-    grid.appendChild(buildAssetCard(sym, sigs[sym]));
+    list.appendChild(buildAssetRow(sym, sigs[sym]));
   }
+  if (!syms.length) list.innerHTML = '<div class="empty">Sin datos todavia.</div>';
+}
+
+function pnlBarHtml(pnl, range) {
+  if (pnl === undefined || pnl === null) {
+    return { pnlHtml: '<span class="pnl">s/dato</span>', barHtml: '' };
+  }
+  const cls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+  const pnlHtml = '<span class="pnl ' + cls + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + '</span>';
+  const pct = Math.max(-100, Math.min(100, (pnl / range) * 100));
+  const fillColor = pnl >= 0 ? '#2ecc71' : '#e74c3c';
+  const left = pct >= 0 ? '50%' : (50 + pct / 2) + '%';
+  const width = Math.abs(pct) / 2 + '%';
+  const barHtml = '<div class="pos-bar"><div class="pos-fill" style="left:' + left + ';width:' + width + ';background:' + fillColor + '"></div></div>';
+  return { pnlHtml, barHtml };
+}
+
+function renderScalperPositions(signals) {
+  const posList = document.getElementById('positionsList');
+  posList.innerHTML = '';
+  const ownPos = signals.own_positions || {};
+  let any = false;
+  for (const sym in ownPos) {
+    for (const p of ownPos[sym]) {
+      any = true;
+      const pnl = livePnl[p.deal_id];
+      const dir = p.direction === 'BUY' ? 'LONG' : 'SHORT';
+      const { pnlHtml, barHtml } = pnlBarHtml(pnl, 2);
+      const row = document.createElement('div');
+      row.className = 'prow';
+      row.innerHTML =
+        '<div class="prow-sym">' + sym + ' ' + dir + '</div>' +
+        '<div class="prow-info">entrada ' + p.entry + '</div>' +
+        '<div class="prow-bar-wrap">' + barHtml + '</div>' +
+        pnlHtml;
+      posList.appendChild(row);
+    }
+  }
+  if (!any) posList.innerHTML = '<div class="empty">Sin posiciones abiertas ahora.</div>';
 }
 
 async function fetchSwing() {
   const statusEl = document.getElementById('swingStatus');
-  const grid = document.getElementById('swingGrid');
   try {
     const res = await fetch('/swing-proxy');
     const data = await res.json();
@@ -759,53 +831,39 @@ async function fetchSwing() {
     if (secAgo === null) {
       statusEl.innerText = 'Sin datos del Bot Swing todavia';
     } else if (secAgo < 20 * 60) {
-      statusEl.innerText = 'Funcionando bien - ultimo scan hace ' + Math.round(secAgo / 60) + ' min (revisa cada 15 min)';
+      statusEl.innerText = 'Velas diarias - funcionando bien - ultimo scan hace ' + Math.round(secAgo / 60) + ' min (revisa cada 15 min)';
     } else {
       statusEl.innerText = 'POSIBLE FALLA - ultimo scan hace ' + Math.round(secAgo / 60) + ' min';
     }
-    grid.innerHTML = '';
-    const sigs = (data.signals && data.signals.signals) || {};
-    const syms = Object.keys(sigs).sort();
-    for (const sym of syms) {
-      grid.appendChild(buildAssetCard(sym, sigs[sym]));
-    }
+    renderAssetsList('swingList', (data.signals && data.signals.signals) || {});
+    renderSwingPositions(data.swing_positions || []);
   } catch (e) {
     statusEl.innerText = 'Error consultando al Bot Swing';
   }
 }
 
-function renderPositions(signals) {
-  const posList = document.getElementById('positionsList');
+function renderSwingPositions(positions) {
+  const posList = document.getElementById('swingPositionsList');
   posList.innerHTML = '';
-  const ownPos = signals.own_positions || {};
-  let any = false;
-  for (const sym in ownPos) {
-    for (const p of ownPos[sym]) {
-      any = true;
-      const pnl = livePnl[p.deal_id];
-      const dir = p.direction === 'BUY' ? 'LONG' : 'SHORT';
-      const card = document.createElement('div');
-      card.className = 'pos-card';
-      let pnlHtml = '<span class="pnl">sin dato aun</span>';
-      let barHtml = '';
-      if (pnl !== undefined && pnl !== null) {
-        const cls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
-        pnlHtml = '<span class="pnl ' + cls + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USD</span>';
-        const pct = Math.max(-100, Math.min(100, (pnl / 2) * 100));
-        const fillColor = pnl >= 0 ? '#2ecc71' : '#e74c3c';
-        const left = pct >= 0 ? '50%' : (50 + pct / 2) + '%';
-        const width = Math.abs(pct) / 2 + '%';
-        barHtml = '<div class="pos-bar"><div class="pos-fill" style="left:' + left + ';width:' + width + ';background:' + fillColor + '"></div></div>';
-      }
-      card.innerHTML =
-        '<div class="pos-top"><div class="sym">' + sym + ' ' + dir + '</div>' + pnlHtml + '</div>' +
-        '<div class="rsi-val">Entrada ' + p.entry + ' - abierta ' + p.open_time + '</div>' +
-        barHtml;
-      posList.appendChild(card);
-    }
+  if (!positions.length) {
+    posList.innerHTML = '<div class="empty">Sin posiciones abiertas ahora.</div>';
+    return;
   }
-  if (!any) posList.innerHTML = '<div class="empty">Sin posiciones abiertas ahora.</div>';
-  document.getElementById('updated').innerText = 'Actualizado ' + new Date().toLocaleTimeString();
+  for (const p of positions) {
+    const dir = p.direction === 'BUY' ? 'LONG' : 'SHORT';
+    // v7.7: al Swing (velas diarias/ATR grande) no le aplica el techo de +-$2
+    // del Scalper - la barra usa un rango mas amplio (+-$100) solo como
+    // referencia visual, no como techo real de cierre.
+    const { pnlHtml, barHtml } = pnlBarHtml(p.upl, 100);
+    const row = document.createElement('div');
+    row.className = 'prow';
+    row.innerHTML =
+      '<div class="prow-sym">' + p.epic + ' ' + dir + '</div>' +
+      '<div class="prow-info">entrada ' + p.entry + '</div>' +
+      '<div class="prow-bar-wrap">' + barHtml + '</div>' +
+      pnlHtml;
+    posList.appendChild(row);
+  }
 }
 
 async function toggleTrading() {
@@ -840,6 +898,16 @@ def swing_proxy():
     sin CORS de por medio) y se reenvia tal cual al frontend. Solo lectura
     de endpoints publicos de status - nunca se llama nada que module el
     trading del Bot Swing, se respeta la separacion total entre bots.
+
+    v7.7: el propio tracking interno del Bot Swing (own_positions) pierde
+    el rastro de sus posiciones en cada redeploy (mismo tipo de bug que
+    se arreglo en el Scalper v7.3c) - por eso su /signals reporta
+    "positions": {} aun teniendo una posicion realmente abierta. En vez
+    de tocar el repo del Swing, se derivan sus posiciones reales desde
+    la cuenta compartida de Capital.com (ya autenticada aca mismo via
+    `client`): cualquier posicion cuyo epic NO pertenezca al universo de
+    activos del Scalper (SYMBOL_MAP) es, por descarte, del Bot Swing -
+    los dos bots usan universos de activos sin superposicion por diseño.
     """
     try:
         health = requests.get(f"{SWING_BASE_URL}/", timeout=8).json()
@@ -849,7 +917,29 @@ def swing_proxy():
         signals = requests.get(f"{SWING_BASE_URL}/signals", timeout=8).json()
     except Exception as e:
         signals = {"error": str(e)}
-    return jsonify({"health": health, "signals": signals}), 200
+
+    from capital_client import SYMBOL_MAP as SCALPER_SYMBOL_MAP
+    scalper_epics = set(SCALPER_SYMBOL_MAP.values())
+    swing_positions = []
+    try:
+        for p in (client.get_positions() or []):
+            epic = p.get("market", {}).get("epic")
+            if epic in scalper_epics:
+                continue  # es del Scalper, no del Swing
+            pos = p.get("position", {})
+            swing_positions.append({
+                "epic":      epic,
+                "direction": pos.get("direction"),
+                "entry":     pos.get("level"),
+                "upl":       pos.get("upl"),
+                "size":      pos.get("size"),
+                "created":   pos.get("createdDateUTC"),
+                "dealId":    pos.get("dealId"),
+            })
+    except Exception as e:
+        logger.warning(f"[swing-proxy] No se pudieron derivar posiciones del Swing: {e}")
+
+    return jsonify({"health": health, "signals": signals, "swing_positions": swing_positions}), 200
 
 
 @app.route("/signals", methods=["GET"])
