@@ -1186,6 +1186,41 @@ def stats():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug-markets", methods=["GET"])
+def debug_markets():
+    """
+    TEMPORAL (v7.10 prep) - busca instrumentos reales en Capital.com para
+    confirmar el epic exacto antes de agregarlos al universo del scalper.
+    Se borra una vez que la lista final de activos nuevos este confirmada.
+    Uso: /debug-markets?q=ADA
+    """
+    q = request.args.get("q", "")
+    try:
+        client.ensure_session()
+        import requests as _rq
+        resp = _rq.get(
+            "https://demo-api-capital.backend-capital.com/api/v1/markets",
+            headers=client._headers(),
+            params={"searchTerm": q},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        markets = resp.json().get("markets", [])
+        out = [
+            {
+                "epic": m.get("epic"),
+                "instrumentName": m.get("instrumentName"),
+                "instrumentType": m.get("instrumentType"),
+                "marketStatus": m.get("marketStatus"),
+                "minSize": m.get("dealingRules", {}).get("minDealSize", {}).get("value"),
+            }
+            for m in markets
+        ]
+        return jsonify({"query": q, "count": len(out), "markets": out}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
