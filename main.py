@@ -1226,6 +1226,23 @@ def debug_tx_raw():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug-market-full", methods=["GET"])
+def debug_market_full():
+    """TEMPORAL — vuelca el JSON completo de un instrumento (margen, etc)."""
+    epic = request.args.get("epic", "TSLA")
+    try:
+        client.ensure_session()
+        import requests as _rq
+        resp = _rq.get(
+            f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
+            headers=client._headers(), timeout=15,
+        )
+        resp.raise_for_status()
+        return jsonify(resp.json()), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
