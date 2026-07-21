@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.7
+main.py — Bot Scalper v7.8
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -48,6 +48,11 @@ pierde el rastro de sus posiciones en cada redeploy - las posiciones
 del Swing que se muestran ahora se derivan de la cuenta compartida de
 Capital.com (via /swing-proxy), filtrando por epics que no pertenecen
 al universo de activos del Scalper.
+
+v7.8 (20/07/2026): los dos bloques (Bot Scalper / Bot Swing) pasan a
+mostrarse lado a lado en pantallas anchas (PC), y apilados uno encima
+del otro en celular (media query, breakpoint 900px) - para que las
+filas de activos no queden ilegibles apretadas en pantalla chica.
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -590,11 +595,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .btn-pause { background:#c53030; color:white; }
   .btn-resume { background:#1f9d55; color:white; }
 
+  .two-col { display:flex; flex-direction:column; gap:20px; }
   .bloque { background:#10131c; border:1px solid #1e2430; border-radius:14px; padding:16px; margin-bottom:20px; }
   .bloque-header { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:4px; }
   .bloque-title { font-size:17px; font-weight:bold; color:#fff; }
   .bloque-sub { font-size:11px; color:#666; margin-bottom:14px; }
   h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:#667; margin:16px 0 8px; }
+
+  /* v7.8: en pantallas anchas (PC) las dos columnas van lado a lado.
+     En celular (pantalla angosta) se apilan una encima de la otra,
+     para que las filas de activos no queden ilegibles apretadas. */
+  @media (min-width: 900px) {
+    .two-col { flex-direction: row; align-items: flex-start; }
+    .two-col > .bloque { flex: 1 1 0; min-width: 0; margin-bottom: 0; }
+  }
 
   .list { display:flex; flex-direction:column; gap:6px; }
   .row { display:flex; align-items:center; gap:14px; background:#161b26; border:1px solid #232a3a;
@@ -641,22 +655,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button id="toggleBtn" onclick="toggleTrading()">...</button>
   </div>
 
-  <div class="bloque">
-    <div class="bloque-header"><div class="bloque-title">Bot Scalper</div></div>
-    <div class="bloque-sub">Velas de 5 min - mean reversion RSI</div>
-    <h3>Activos</h3>
-    <div class="list" id="assetsList"></div>
-    <h3>Posiciones abiertas</h3>
-    <div class="list" id="positionsList"><div class="empty">Cargando...</div></div>
-  </div>
+  <div class="two-col">
+    <div class="bloque">
+      <div class="bloque-header"><div class="bloque-title">Bot Scalper</div></div>
+      <div class="bloque-sub">Velas de 5 min - mean reversion RSI</div>
+      <h3>Activos</h3>
+      <div class="list" id="assetsList"></div>
+      <h3>Posiciones abiertas</h3>
+      <div class="list" id="positionsList"><div class="empty">Cargando...</div></div>
+    </div>
 
-  <div class="bloque">
-    <div class="bloque-header"><div class="bloque-title">Bot Swing</div></div>
-    <div class="bloque-sub" id="swingStatus">Cargando...</div>
-    <h3>Activos</h3>
-    <div class="list" id="swingList"></div>
-    <h3>Posiciones abiertas</h3>
-    <div class="list" id="swingPositionsList"><div class="empty">Cargando...</div></div>
+    <div class="bloque">
+      <div class="bloque-header"><div class="bloque-title">Bot Swing</div></div>
+      <div class="bloque-sub" id="swingStatus">Cargando...</div>
+      <h3>Activos</h3>
+      <div class="list" id="swingList"></div>
+      <h3>Posiciones abiertas</h3>
+      <div class="list" id="swingPositionsList"><div class="empty">Cargando...</div></div>
+    </div>
   </div>
 
   <div class="updated" id="updated"></div>
