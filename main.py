@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.9
+main.py — Bot Scalper v7.10
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -53,6 +53,18 @@ v7.8 (20/07/2026): los dos bloques (Bot Scalper / Bot Swing) pasan a
 mostrarse lado a lado en pantallas anchas (PC), y apilados uno encima
 del otro en celular (media query, breakpoint 900px) - para que las
 filas de activos no queden ilegibles apretadas en pantalla chica.
+
+v7.9 (20/07/2026): endpoint /pnl con resumen de ganancias vs perdidas
+(dia/semana/mes), combinado y separado por bot.
+
+v7.10 (21/07/2026): universo de activos ampliado de 9 a 20. Se suman
+9 criptomonedas (ADAUSD, LTCUSD, LINKUSD, DOTUSD, AVAXUSD, MATICUSD,
+ATOMUSD, XLMUSD, BNBUSD) — epics y minDealSize verificados en vivo
+contra la API de Capital.com antes de sumarlos. Objetivo: mas señales
+de calidad por dia (Matias reporto solo 1 operacion cerrada desde los
+ultimos cambios) y cobertura 24/7 fuera del horario de NYSE para los
+activos de acciones/indice. No se toco el universo del Bot Swing
+(BTCUSD, ETHUSD, etc. quedan exclusivos de ese bot).
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -1183,68 +1195,6 @@ def stats():
         }), 200
     except Exception as e:
         logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-markets", methods=["GET"])
-def debug_markets():
-    """
-    TEMPORAL (v7.10 prep) - busca instrumentos reales en Capital.com para
-    confirmar el epic exacto antes de agregarlos al universo del scalper.
-    Se borra una vez que la lista final de activos nuevos este confirmada.
-    Uso: /debug-markets?q=ADA
-    """
-    q = request.args.get("q", "")
-    try:
-        client.ensure_session()
-        import requests as _rq
-        resp = _rq.get(
-            "https://demo-api-capital.backend-capital.com/api/v1/markets",
-            headers=client._headers(),
-            params={"searchTerm": q},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        markets = resp.json().get("markets", [])
-        out = [
-            {
-                "epic": m.get("epic"),
-                "instrumentName": m.get("instrumentName"),
-                "instrumentType": m.get("instrumentType"),
-                "marketStatus": m.get("marketStatus"),
-                "minSize": m.get("dealingRules", {}).get("minDealSize", {}).get("value"),
-            }
-            for m in markets
-        ]
-        return jsonify({"query": q, "count": len(out), "markets": out}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-market-detail", methods=["GET"])
-def debug_market_detail():
-    """TEMPORAL (v7.10 prep) - detalle de un epic puntual (minDealSize real)."""
-    epic = request.args.get("epic", "")
-    try:
-        client.ensure_session()
-        import requests as _rq
-        resp = _rq.get(
-            f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
-            headers=client._headers(),
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        rules = data.get("dealingRules", {})
-        snap = data.get("snapshot", {})
-        return jsonify({
-            "epic": epic,
-            "minDealSize": rules.get("minDealSize", {}).get("value"),
-            "marketStatus": snap.get("marketStatus"),
-            "bid": snap.get("bid"),
-            "offer": snap.get("offer"),
-        }), 200
-    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 

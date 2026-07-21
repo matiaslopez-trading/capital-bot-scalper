@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540
 
-# Activos del Scalper v7 — mismo universo que v3-v6, separado del Bot Swing
+# Activos del Scalper — universo ampliado v7.10 (20 activos, separado del Bot
+# Swing). Se suman 9 criptomonedas nuevas (epics y minDealSize verificados
+# en vivo contra la API de Capital.com vía /debug-markets antes de sumarlas)
+# para (a) generar mas señales de calidad por dia y (b) cubrir las horas
+# "muertas" fuera del horario de NYSE, ya que crypto opera 24/7. Se evito
+# a proposito pisar el universo del Bot Swing (BTCUSD, ETHUSD, etc).
 SYMBOL_MAP = {
     "US100":   "US100",
     "GBPJPY":  "GBPJPY",
@@ -30,6 +35,16 @@ SYMBOL_MAP = {
     "TSLA":    "TSLA",
     "AAPL":    "AAPL",
     "MSFT":    "MSFT",
+    # v7.10 — nuevos, todos crypto 24/7
+    "ADAUSD":  "ADAUSD",
+    "LTCUSD":  "LTCUSD",
+    "LINKUSD": "LINKUSD",
+    "DOTUSD":  "DOTUSD",
+    "AVAXUSD": "AVAXUSD",
+    "MATICUSD": "MATICUSD",
+    "ATOMUSD": "ATOMUSD",
+    "XLMUSD":  "XLMUSD",
+    "BNBUSD":  "BNBUSD",
 }
 
 # % del balance a arriesgar por operación (score fijo 2 en v7: muchas
@@ -44,7 +59,7 @@ PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 # supera este %, la operacion se aborta en vez de forzarla.
 MAX_EXPOSURE_PCT = 0.10
 
-# Tamaño mínimo Capital.com
+# Tamaño mínimo Capital.com (minDealSize real, verificado via /debug-market-detail)
 MIN_SIZE = {
     "US100":   0.1,
     "GBPJPY":  1000.0,
@@ -55,6 +70,16 @@ MIN_SIZE = {
     "TSLA":    1.0,
     "AAPL":    1.0,
     "MSFT":    1.0,
+    # v7.10
+    "ADAUSD":   10.0,
+    "LTCUSD":   0.1,
+    "LINKUSD":  1.0,
+    "DOTUSD":   1.0,
+    "AVAXUSD":  0.1,
+    "MATICUSD": 10.0,
+    "ATOMUSD":  1.0,
+    "XLMUSD":   10.0,
+    "BNBUSD":   0.01,
 }
 
 
