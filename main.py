@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.4
+main.py — Bot Scalper v7.5
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -23,6 +23,17 @@ v7.4 (20/07/2026): panel manual on/off en GET /panel (boton) y POST
 gestionando/cerrando las que ya estaban abiertas. Pensado para que
 Matias pueda apagarlo antes de dormir sin dejar operaciones sueltas.
 El estado vive en memoria (se resetea a activo en cada redeploy).
+
+v7.5 (20/07/2026): dashboard visual en GET /dashboard. Matias pidió
+poder ver en tiempo real que tan cerca esta cada activo de disparar
+una señal (en vez de leer los logs crudos de Railway) y chequear
+visualmente si algo esta fallando. La pagina hace fetch a / y /signals
+cada 5s (datos en memoria, sin pegarle a la API de Capital.com) y a
+/stats cada 20s (para el PnL en vivo de posiciones abiertas, que si
+pega a Capital.com - por eso mas espaciado). Incluye semaforo de salud
+basado en hace cuanto corrio el ultimo scan, gauge de RSI 0-100 por
+activo con las zonas de sobrecompra/sobreventa marcadas, y el mismo
+boton de pausar/reanudar que /panel.
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -538,6 +549,222 @@ def panel_toggle():
     logger.warning(f"[main] Trading {'REANUDADO' if nuevo else 'PAUSADO'} manualmente via /panel/toggle.")
     from flask import redirect
     return redirect("/panel", code=303)
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Scalper - Dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background:#0b0e14; color:#e6e6e6; margin:0; padding:16px; }
+  .header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; margin-bottom:20px; }
+  .status { display:flex; align-items:center; gap:8px; font-size:15px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  .dot.ok { background:#2ecc71; box-shadow:0 0 8px #2ecc71; }
+  .dot.warn { background:#f1c40f; box-shadow:0 0 8px #f1c40f; }
+  .dot.bad { background:#e74c3c; box-shadow:0 0 8px #e74c3c; }
+  button { font-size:14px; padding:10px 18px; border-radius:8px; border:none; font-weight:bold; cursor:pointer; }
+  .btn-pause { background:#c53030; color:white; }
+  .btn-resume { background:#1f9d55; color:white; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap:12px; margin-bottom:24px; }
+  .card { background:#161b26; border-radius:12px; padding:14px; border:1px solid #232a3a; }
+  .sym { font-weight:bold; font-size:15px; margin-bottom:6px; }
+  .rsi-val { font-size:12px; color:#999; margin-bottom:8px; min-height:32px; }
+  .gauge { position:relative; height:10px; border-radius:5px;
+           background: linear-gradient(to right, #e74c3c 0%, #e74c3c 30%, #2a2f3d 30%, #2a2f3d 70%, #2ecc71 70%, #2ecc71 100%);
+           margin-bottom:8px; }
+  .marker { position:absolute; top:-4px; width:4px; height:18px; background:#fff; border-radius:2px; }
+  .signal { font-size:13px; font-weight:bold; }
+  .signal-LONG { color:#2ecc71; }
+  .signal-SHORT { color:#e74c3c; }
+  .signal-ESPERAR { color:#777; }
+  .filtro { font-size:11px; color:#666; margin-top:4px; }
+  h2 { font-size:15px; color:#ccc; margin: 24px 0 10px; }
+  .pos-card { background:#161b26; border-radius:12px; padding:14px; margin-bottom:10px; border:1px solid #232a3a; }
+  .pos-top { display:flex; justify-content:space-between; align-items:center; }
+  .pnl { font-weight:bold; font-size:15px; }
+  .pnl-pos { color:#2ecc71; }
+  .pnl-neg { color:#e74c3c; }
+  .pos-bar { position:relative; height:10px; border-radius:5px; background:#2a2f3d; margin-top:10px; overflow:hidden; }
+  .pos-fill { position:absolute; height:100%; top:0; }
+  .empty { color:#666; font-size:13px; }
+  .updated { font-size:11px; color:#555; text-align:right; margin-top:20px; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="status">
+      <span class="dot" id="dot"></span>
+      <span id="statusText">Cargando...</span>
+    </div>
+    <button id="toggleBtn" onclick="toggleTrading()">...</button>
+  </div>
+
+  <h2>Activos - RSI en vivo (5min)</h2>
+  <div class="grid" id="assetsGrid"></div>
+
+  <h2>Posiciones abiertas</h2>
+  <div id="positionsList"><div class="empty">Cargando...</div></div>
+
+  <div class="updated" id="updated"></div>
+
+<script>
+let livePnl = {};
+
+async function fetchFast() {
+  try {
+    const [healthRes, signalsRes] = await Promise.all([fetch('/'), fetch('/signals')]);
+    const health = await healthRes.json();
+    const signals = await signalsRes.json();
+    renderHealth(health);
+    renderAssets(signals);
+    renderPositions(signals, health);
+  } catch (e) {
+    document.getElementById('statusText').innerText = 'Error de conexion con el bot';
+    document.getElementById('dot').className = 'dot bad';
+  }
+}
+
+async function fetchSlow() {
+  try {
+    const res = await fetch('/stats');
+    const stats = await res.json();
+    livePnl = {};
+    for (const p of (stats.positions || [])) {
+      const dealId = p.position && p.position.dealId;
+      if (dealId) livePnl[dealId] = p.position.upl;
+    }
+  } catch (e) {
+    // /stats pega directo a Capital.com, puede fallar por rate limit - se ignora, se reintenta solo
+  }
+}
+
+function timeAgoSec(iso) {
+  if (!iso) return null;
+  return (Date.now() - new Date(iso).getTime()) / 1000;
+}
+
+function renderHealth(health) {
+  const secAgo = timeAgoSec(health.last_scan);
+  const dot = document.getElementById('dot');
+  const statusText = document.getElementById('statusText');
+  if (secAgo === null) {
+    dot.className = 'dot bad';
+    statusText.innerText = 'Sin datos todavia';
+  } else if (secAgo < 90) {
+    dot.className = 'dot ok';
+    statusText.innerText = 'Funcionando bien - ultimo scan hace ' + Math.round(secAgo) + 's';
+  } else if (secAgo < 240) {
+    dot.className = 'dot warn';
+    statusText.innerText = 'Demorado - ultimo scan hace ' + Math.round(secAgo) + 's';
+  } else {
+    dot.className = 'dot bad';
+    statusText.innerText = 'POSIBLE FALLA - ultimo scan hace ' + Math.round(secAgo / 60) + ' min';
+  }
+
+  const btn = document.getElementById('toggleBtn');
+  if (health.trading_habilitado) {
+    btn.innerText = 'Pausar bot';
+    btn.className = 'btn-pause';
+  } else {
+    btn.innerText = 'Reanudar bot';
+    btn.className = 'btn-resume';
+  }
+}
+
+function distanciaTexto(rsi) {
+  if (rsi === null || rsi === undefined) return '';
+  if (rsi > 30 && rsi < 70) {
+    const distLong = rsi - 30, distShort = 70 - rsi;
+    if (distLong < distShort) return 'faltan ' + distLong.toFixed(1) + ' pts para sobreventa (long)';
+    return 'faltan ' + distShort.toFixed(1) + ' pts para sobrecompra (short)';
+  } else if (rsi <= 30) {
+    return 'en zona de sobreventa';
+  }
+  return 'en zona de sobrecompra';
+}
+
+function renderAssets(signals) {
+  const grid = document.getElementById('assetsGrid');
+  grid.innerHTML = '';
+  const sigs = signals.signals || {};
+  const syms = Object.keys(sigs).sort();
+  for (const sym of syms) {
+    const s = sigs[sym];
+    const rsi = (s.rsi !== undefined && s.rsi !== null) ? s.rsi : null;
+    const markerLeft = rsi !== null ? Math.max(0, Math.min(100, rsi)) : 50;
+    const rsiTxt = rsi !== null ? rsi.toFixed(1) : '-';
+    const sig = s.signal || 'ESPERAR';
+    const card = document.createElement('div');
+    card.className = 'card';
+    let extra = '';
+    if (s.filtro) extra = '<div class="filtro">' + s.filtro + '</div>';
+    if (s.error) extra = '<div class="filtro">error: ' + s.error + '</div>';
+    card.innerHTML =
+      '<div class="sym">' + sym + '</div>' +
+      '<div class="rsi-val">RSI ' + rsiTxt + '<br>' + distanciaTexto(rsi) + '</div>' +
+      '<div class="gauge"><div class="marker" style="left:calc(' + markerLeft + '% - 2px)"></div></div>' +
+      '<div class="signal signal-' + sig + '">' + sig + '</div>' +
+      extra;
+    grid.appendChild(card);
+  }
+}
+
+function renderPositions(signals) {
+  const posList = document.getElementById('positionsList');
+  posList.innerHTML = '';
+  const ownPos = signals.own_positions || {};
+  let any = false;
+  for (const sym in ownPos) {
+    for (const p of ownPos[sym]) {
+      any = true;
+      const pnl = livePnl[p.deal_id];
+      const dir = p.direction === 'BUY' ? 'LONG' : 'SHORT';
+      const card = document.createElement('div');
+      card.className = 'pos-card';
+      let pnlHtml = '<span class="pnl">sin dato aun</span>';
+      let barHtml = '';
+      if (pnl !== undefined && pnl !== null) {
+        const cls = pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        pnlHtml = '<span class="pnl ' + cls + '">' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2) + ' USD</span>';
+        const pct = Math.max(-100, Math.min(100, (pnl / 2) * 100));
+        const fillColor = pnl >= 0 ? '#2ecc71' : '#e74c3c';
+        const left = pct >= 0 ? '50%' : (50 + pct / 2) + '%';
+        const width = Math.abs(pct) / 2 + '%';
+        barHtml = '<div class="pos-bar"><div class="pos-fill" style="left:' + left + ';width:' + width + ';background:' + fillColor + '"></div></div>';
+      }
+      card.innerHTML =
+        '<div class="pos-top"><div class="sym">' + sym + ' ' + dir + '</div>' + pnlHtml + '</div>' +
+        '<div class="rsi-val">Entrada ' + p.entry + ' - abierta ' + p.open_time + '</div>' +
+        barHtml;
+      posList.appendChild(card);
+    }
+  }
+  if (!any) posList.innerHTML = '<div class="empty">Sin posiciones abiertas ahora.</div>';
+  document.getElementById('updated').innerText = 'Actualizado ' + new Date().toLocaleTimeString();
+}
+
+async function toggleTrading() {
+  await fetch('/panel/toggle', { method: 'POST' });
+  fetchFast();
+}
+
+fetchFast();
+fetchSlow();
+setInterval(fetchFast, 5000);
+setInterval(fetchSlow, 20000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    return DASHBOARD_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/signals", methods=["GET"])
