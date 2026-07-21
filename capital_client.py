@@ -10,6 +10,7 @@ Cambios v7:
 
 import os
 import time
+import math
 import logging
 import requests
 from datetime import datetime, timedelta
@@ -120,6 +121,39 @@ GUARANTEED_STOP_PCT = {
     "ATOMUSD":  75.0,
     "XLMUSD":   2.0,
     "BNBUSD":   75.0,
+}
+
+# v7.14 FIX CRITICO: Capital.com exige que el tamaño de la posición sea un
+# MULTIPLO EXACTO de este incremento por activo (dealingRules.minSizeIncrement).
+# El sizing de v7.13 calculaba un tamaño "objetivo" (FIXED_SL_USD / distancia
+# del stop garantizado) que casi nunca cae justo en un múltiplo válido — para
+# 13 de los 18 activos (ADAUSD, AMZN, ATOMUSD, AVAXUSD, DOGEUSD, DOTUSD,
+# LINKUSD, LTCUSD, MSFT, SOLUSD, US100, XLMUSD, XRPUSD) el tamaño calculado
+# no era múltiplo del incremento exigido, lo que la API de Capital.com
+# rechazaba silenciosamente (400) — la señal parecía valida en el dashboard
+# pero la operación nunca se abría. Verificado en vivo el 21/07/2026 con
+# ATOMUSD (RSI en sobreventa, señal LONG, pero ninguna posición se creaba).
+# Ahora open_position() redondea el tamaño HACIA ARRIBA al múltiplo válido
+# más cercano antes de enviar la orden.
+MIN_SIZE_INCREMENT = {
+    "US100":    0.001,
+    "GBPJPY":   100.0,
+    "DOGEUSD":  1.0,
+    "XRPUSD":   1.0,
+    "SOLUSD":   0.1,
+    "AMZN":     0.1,
+    "TSLA":     0.1,
+    "AAPL":     0.01,
+    "MSFT":     0.01,
+    "ADAUSD":   1.0,
+    "LTCUSD":   0.1,
+    "LINKUSD":  1.0,
+    "DOTUSD":   1.0,
+    "AVAXUSD":  0.1,
+    "MATICUSD": 0.1,
+    "ATOMUSD":  1.0,
+    "XLMUSD":   1.0,
+    "BNBUSD":   0.01,
 }
 
 # v7.13: capital de referencia FIJO para el sizing del Scalper - a proposito
@@ -298,12 +332,16 @@ class CapitalClient:
         max_exposure = EFFECTIVE_BALANCE * MAX_EXPOSURE_PCT
         size_cap     = max_exposure / entry
         size         = min(size, size_cap)
-        size         = round(size, 4)
 
         if size < min_size:
             # El guardrail de exposicion (10% de $1000) no alcanza ni para
             # el tamaño minimo que exige la plataforma en este activo -
-            # no es operable con este capital de referencia.
+            # no es operable con este capital de referencia. IMPORTANTE:
+            # este chequeo va ANTES de redondear al incremento — si se
+            # hiciera despues, el redondeo hacia arriba forzaria el tamaño
+            # de vuelta al minimo (ej. GBPJPY: min=100, cap real da 0.46,
+            # pero redondear 0.46 al incremento de 100 da... 100 de nuevo,
+            # anulando por completo el guardrail de exposicion).
             logger.warning(
                 f"[client] {symbol}: operacion abortada - el minimo de la "
                 f"plataforma ({min_size}) implica exposicion "
@@ -312,6 +350,17 @@ class CapitalClient:
                 f"${EFFECTIVE_BALANCE:.0f}). Activo no operable con este capital."
             )
             return None
+
+        # v7.14 FIX: redondear HACIA ARRIBA al multiplo valido de
+        # minSizeIncrement (Capital.com rechaza tamaños que no sean un
+        # multiplo exacto — esto era lo que impedia ejecutar 13 de los 18
+        # activos, incl. ATOMUSD, aun con señal y capital validos). Se aplica
+        # DESPUES del chequeo de abort de arriba, asi nunca revive una
+        # operacion que el guardrail de exposicion ya descarto.
+        increment = MIN_SIZE_INCREMENT.get(epic, min_size)
+        if increment > 0:
+            size = math.ceil(round(size / increment, 6)) * increment
+        size = round(size, 6)
 
         # Perdida/ganancia REAL que va a resultar si se toca el stop/TP,
         # dado el tamaño final (puede ser distinto de FIXED_SL_USD si el
