@@ -66,6 +66,18 @@ ultimos cambios) y cobertura 24/7 fuera del horario de NYSE para los
 activos de acciones/indice. No se toco el universo del Bot Swing
 (BTCUSD, ETHUSD, etc. quedan exclusivos de ese bot).
 
+v7.10.1 (21/07/2026): fix critico en capital_client.py — el tope de
+sizing por posicion (15% del balance) y el guardrail de exposicion
+maxima (10%) se contradecian: cada vez que el tope de 15% era el que
+mandaba (SL ajustado, tipico en scalping), la exposicion resultante
+quedaba fija en 15% del balance, que siempre supera el 10% del
+guardrail y aborta la operacion. Esto probablemente bloqueo la gran
+mayoria de las señales validas desde que se agrego el guardrail, no
+solo en activos puntuales. Confirmado en vivo con un short real de
+TSLA que se hubiera abortado. Fix: el tope de sizing ahora usa
+MAX_EXPOSURE_PCT en vez de un 15% hardcodeado, para que ambos limites
+sean siempre consistentes.
+
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
 desaciertos. Hasta 2 posiciones simultáneas por activo.
@@ -1195,58 +1207,6 @@ def stats():
         }), 200
     except Exception as e:
         logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-sizing", methods=["GET"])
-def debug_sizing():
-    """
-    TEMPORAL — replica el calculo de sizing de open_position() SIN abrir
-    ninguna operacion, para diagnosticar por que una señal visible en el
-    dashboard no se termina ejecutando (ej. rechazada por el guardrail
-    de exposicion). Uso: /debug-sizing?symbol=TSLA
-    """
-    from capital_client import PCT_POR_SCORE, MIN_SIZE, MAX_EXPOSURE_PCT, SYMBOL_MAP
-    sym = request.args.get("symbol", "")
-    try:
-        with scanner_lock:
-            sig = dict(scanner_state.get(sym, {}))
-        entry = request.args.get("entry", type=float)
-        sl    = request.args.get("sl", type=float)
-        if entry is None:
-            if not sig:
-                return jsonify({"error": f"sin señal en memoria para {sym}"}), 404
-            entry = sig.get("entry")
-            sl    = sig.get("sl")
-        score = 2
-        balance = client.get_balance()
-        pct = PCT_POR_SCORE.get(min(abs(score), 6), 0.015)
-        risk_usd = balance * pct
-        sl_dist = abs(entry - sl) if sl and sl != entry else 0
-        size_raw = round(risk_usd / sl_dist, 4) if sl_dist > 0 else round(risk_usd / entry, 4)
-        cap_15 = round((balance * 0.15) / entry, 4) if entry > 0 else None
-        size_after_cap = min(size_raw, cap_15) if cap_15 is not None else size_raw
-        min_size = MIN_SIZE.get(sym, 1.0)
-        size_final = max(size_after_cap, min_size)
-        exposure = size_final * entry if entry > 0 else 0
-        max_exposure = balance * MAX_EXPOSURE_PCT
-        return jsonify({
-            "symbol": sym,
-            "balance": balance,
-            "entry": entry,
-            "sl": sl,
-            "sl_dist": sl_dist,
-            "risk_usd_1.5pct": round(risk_usd, 2),
-            "size_raw_por_riesgo": size_raw,
-            "cap_15pct_balance": cap_15,
-            "size_despues_de_cap": size_after_cap,
-            "min_size_plataforma": min_size,
-            "size_final": size_final,
-            "exposure_final_usd": round(exposure, 2),
-            "max_exposure_10pct_usd": round(max_exposure, 2),
-            "SE_ABORTARIA": exposure > max_exposure,
-        }), 200
-    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 

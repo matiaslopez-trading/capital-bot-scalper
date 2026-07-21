@@ -206,10 +206,22 @@ class CapitalClient:
             size = round(risk_usd / sl_dist, 4)
         else:
             size = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        # Cap: no más del 15% del balance en margen por posición individual
-        # (más bajo que antes porque ahora puede haber 2 posiciones por activo)
+        # Cap: no más del 10% del balance en margen por posición individual.
+        # v7.10.1 fix: antes era 15%, pero eso chocaba directo contra el
+        # guardrail de exposicion maxima (MAX_EXPOSURE_PCT=10%, ver abajo) -
+        # cada vez que este cap era el que mandaba (SL ajustado, tipico en
+        # scalping), la exposicion resultante quedaba fija en 15% del
+        # balance, que SIEMPRE supera el limite del 10% del guardrail y
+        # aborta la operacion. Confirmado en vivo (TSLA, 21/07/2026): un
+        # short valido con ATR ajustado se calculaba en 8.06 acciones
+        # ($3018 de exposicion, 15% de $20.121) y el guardrail lo rechazaba
+        # porque el limite es $2012 (10%). Bajar este cap a 10% hace que
+        # ambos limites sean consistentes: el guardrail solo actua para su
+        # proposito original (tamaño minimo de la plataforma
+        # desproporcionado), no como un choque estructural contra el
+        # sizing normal.
         if entry > 0:
-            size = min(size, round((balance * 0.15) / entry, 4))
+            size = min(size, round((balance * MAX_EXPOSURE_PCT) / entry, 4))
         size = max(size, MIN_SIZE.get(epic, 1.0))
 
         # v7.3d: guardrail de exposicion maxima. El paso anterior puede
