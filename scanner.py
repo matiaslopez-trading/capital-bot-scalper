@@ -1,5 +1,5 @@
 """
-scanner.py — Bot Scalper v7.2
+scanner.py — Bot Scalper v7.11
 Estrategia: mean-reversion pura en velas de 5 minutos.
 
 v7.2 (20/07/2026): fix critico — ahora se descarta siempre la ultima
@@ -9,6 +9,20 @@ ruido, no por señal real. El 20/07 esto causo 170 operaciones en un dia
 con 28% de aciertos y -$673 netos (ver CSV de la cuenta). Ahora solo se
 opera sobre velas de 5min ya cerradas.
 
+v7.11 (21/07/2026): umbral de RSI relajado de 30/70 a 35/65. Con 18
+activos activos y el guardrail de exposicion ya arreglado (v7.10.1),
+se observaron horas seguidas sin que NINGUN activo tocara 30/70 (rango
+real observado: 38-64) - cero señales, cero operaciones nuevas del
+Scalper en todo el dia. Matias pidio explicitamente relajar el umbral
+tras ser advertido de que esto fue justamente lo que causo el desastre
+de las 170 operaciones (28% aciertos) cuando se hizo sin medir impacto
+en el pasado. Diferencia clave esta vez: la vela de confirmacion sigue
+siendo obligatoria (nada cambia ahi) y el fix v7.2 (no operar sobre la
+vela todavia en formacion) sigue vigente - solo se ensancha la zona
+donde se considera "extremo", no se elimina el filtro de calidad.
+Monitorear win rate de las primeras operaciones bajo este umbral antes
+de decidir si se mantiene.
+
 Objetivo: MUCHAS operaciones de calidad por día (no pocas con R:R alto).
 Sin filtro de tendencia superior — opera LONG y SHORT indistintamente,
 el criterio de calidad viene de RSI extremo + confirmación de vela
@@ -17,12 +31,12 @@ Admiral Markets, sección "Velas Japonesas").
 
 Lógica de entrada:
   LONG:
-      - RSI(14) <= 30 (zona de sobreventa)
+      - RSI(14) <= 35 (zona de sobreventa, relajado desde 30 en v7.11)
       - Confirmación: vela martillo, envolvente alcista,
         o vela verde con RSI ya girando hacia arriba (rsi_curr > rsi_prev)
 
   SHORT:
-      - RSI(14) >= 70 (zona de sobrecompra)
+      - RSI(14) >= 65 (zona de sobrecompra, relajado desde 70 en v7.11)
       - Confirmación: vela estrella fugaz, envolvente bajista,
         o vela roja con RSI ya girando hacia abajo (rsi_curr < rsi_prev)
 
@@ -44,8 +58,8 @@ logger = logging.getLogger(__name__)
 
 # ── Parámetros RSI ─────────────────────────────────────────────────────────
 RSI_LEN    = 14
-OVERSOLD   = 30
-OVERBOUGHT = 70
+OVERSOLD   = 35   # v7.11: relajado desde 30 (0 señales en horas con umbral estricto)
+OVERBOUGHT = 65   # v7.11: relajado desde 70
 EXIT_LONG_RSI  = 55   # salida anticipada LONG: RSI volvió a zona neutral+
 EXIT_SHORT_RSI = 45   # salida anticipada SHORT: RSI volvió a zona neutral-
 
