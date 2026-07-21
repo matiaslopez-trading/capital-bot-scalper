@@ -59,17 +59,25 @@ PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 # supera este %, la operacion se aborta en vez de forzarla.
 MAX_EXPOSURE_PCT = 0.10
 
-# Tamaño mínimo Capital.com (minDealSize real, verificado via /debug-market-detail)
+# Tamaño mínimo Capital.com (minDealSize real, verificado via /debug-market-full).
+# v7.12 FIX: los 9 valores originales (US100...MSFT) estaban mal cargados
+# de antes de esta sesion - eran hasta 100x mas grandes que el minimo real
+# de la plataforma (ej. XRPUSD tenia 100 hardcodeado, el real es 1; DOGEUSD
+# tenia 1000, el real es 10; US100 tenia 0.1, el real es 0.001). Esto
+# forzaba exposicion innecesariamente grande en cada operacion de esos
+# activos y contribuia a que el guardrail de exposicion los abortara mas
+# seguido de lo necesario. Los 9 activos agregados en v7.10 (ADAUSD en
+# adelante) ya estaban verificados correctamente.
 MIN_SIZE = {
-    "US100":   0.1,
-    "GBPJPY":  1000.0,
-    "DOGEUSD": 1000.0,
-    "XRPUSD":  100.0,
-    "SOLUSD":  1.0,
-    "AMZN":    1.0,
-    "TSLA":    1.0,
-    "AAPL":    1.0,
-    "MSFT":    1.0,
+    "US100":   0.001,
+    "GBPJPY":  100.0,
+    "DOGEUSD": 10.0,
+    "XRPUSD":  1.0,
+    "SOLUSD":  0.1,
+    "AMZN":    0.1,
+    "TSLA":    0.1,
+    "AAPL":    0.1,
+    "MSFT":    0.01,
     # v7.10
     "ADAUSD":   10.0,
     "LTCUSD":   0.1,

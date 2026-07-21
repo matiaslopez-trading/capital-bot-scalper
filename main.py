@@ -1210,39 +1210,6 @@ def stats():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/debug-tx-raw", methods=["GET"])
-def debug_tx_raw():
-    """TEMPORAL — vuelca transacciones crudas (todos los campos) de hoy."""
-    try:
-        now = datetime.now(timezone.utc)
-        since = now - timedelta(hours=int(request.args.get("hours", 14)))
-        txs = client.get_transactions(
-            since.strftime("%Y-%m-%dT%H:%M:%S"),
-            now.strftime("%Y-%m-%dT%H:%M:%S"),
-        )
-        trades = [t for t in txs if t.get("transactionType") == "TRADE"]
-        return jsonify({"count": len(trades), "transactions": trades}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-market-full", methods=["GET"])
-def debug_market_full():
-    """TEMPORAL — vuelca el JSON completo de un instrumento (margen, etc)."""
-    epic = request.args.get("epic", "TSLA")
-    try:
-        client.ensure_session()
-        import requests as _rq
-        resp = _rq.get(
-            f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
-            headers=client._headers(), timeout=15,
-        )
-        resp.raise_for_status()
-        return jsonify(resp.json()), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
