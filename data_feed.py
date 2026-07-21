@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://demo-api-capital.backend-capital.com"
 
-# 20 activos del Bot Scalper (v7.10) — universo separado del Bot Swing (no se
+# 18 activos del Bot Scalper (v7.10) — universo separado del Bot Swing (no se
 # pisan). Se sumaron 9 criptos 24/7 para mas señales y cobertura fuera del
 # horario de NYSE.
 CAPITAL_EPICS = {
@@ -76,7 +76,7 @@ def _fetch(epic, client, resolution, limit):
 
 def get_all_ohlcv(client):
     """
-    Descarga velas de 5 minutos para los 20 activos del scalper.
+    Descarga velas de 5 minutos para los 18 activos del scalper.
     100 velas = ~8.3 horas de historia, suficiente para RSI(14) y ATR(14).
     Retorna: data_5m: { sym: [candles] | None }
     """

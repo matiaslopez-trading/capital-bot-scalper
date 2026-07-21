@@ -57,7 +57,7 @@ filas de activos no queden ilegibles apretadas en pantalla chica.
 v7.9 (20/07/2026): endpoint /pnl con resumen de ganancias vs perdidas
 (dia/semana/mes), combinado y separado por bot.
 
-v7.10 (21/07/2026): universo de activos ampliado de 9 a 20. Se suman
+v7.10 (21/07/2026): universo de activos ampliado de 9 a 18. Se suman
 9 criptomonedas (ADAUSD, LTCUSD, LINKUSD, DOTUSD, AVAXUSD, MATICUSD,
 ATOMUSD, XLMUSD, BNBUSD) — epics y minDealSize verificados en vivo
 contra la API de Capital.com antes de sumarlos. Objetivo: mas señales
