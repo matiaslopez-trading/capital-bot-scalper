@@ -958,6 +958,23 @@ def swing_proxy():
     return jsonify({"health": health, "signals": signals, "swing_positions": swing_positions}), 200
 
 
+@app.route("/debug-tx", methods=["GET"])
+def debug_tx():
+    """
+    v7.9 TEMPORAL: para inspeccionar la forma real de /history/transactions
+    antes de construir el resumen de PnL. Se saca despues de confirmar
+    los nombres de campo correctos.
+    """
+    now = datetime.utcnow()
+    from_iso = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
+    to_iso   = now.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        txs = client.get_transactions(from_iso, to_iso)
+        return jsonify({"count": len(txs), "sample": txs[:5], "from": from_iso, "to": to_iso}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/signals", methods=["GET"])
 def signals():
     with scanner_lock:

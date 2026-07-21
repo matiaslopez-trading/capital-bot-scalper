@@ -122,6 +122,18 @@ class CapitalClient:
         resp.raise_for_status()
         return resp.json().get("positions", [])
 
+    def get_transactions(self, from_iso, to_iso):
+        """
+        v7.9 (debug/PnL): GET /history/transactions - historial de
+        transacciones (trades cerrados, depositos, etc.) con su monto.
+        from_iso/to_iso formato "YYYY-MM-DDTHH:MM:SS".
+        """
+        self.ensure_session()
+        url = f"{BASE_URL}/api/v1/history/transactions?from={from_iso}&to={to_iso}"
+        resp = requests.get(url, headers=self._headers(), timeout=20)
+        resp.raise_for_status()
+        return resp.json().get("transactions", [])
+
     def get_activity_history(self, days=7):
         self.ensure_session()
         all_activities = []
