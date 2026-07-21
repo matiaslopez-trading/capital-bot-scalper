@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.8
+main.py — Bot Scalper v7.9
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -631,6 +631,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .signal-SHORT { color:#0b0e14; background:#e74c3c; }
   .signal-ESPERAR { color:#888; background:transparent; }
 
+  .pnl-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:10px; }
+  .pnl-card { background:#161b26; border:1px solid #232a3a; border-radius:10px; padding:14px; text-align:center; }
+  .pnl-card .plabel { font-size:11px; color:#888; text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px; }
+  .pnl-card .pnet { font-size:22px; font-weight:bold; }
+  .pnl-card .pdetail { font-size:11px; color:#888; margin-top:6px; }
+  .bot-pnl-line { font-size:11px; color:#888; margin: -6px 0 10px; }
+
   .prow { display:flex; align-items:center; gap:14px; background:#161b26; border:1px solid #232a3a;
           border-radius:8px; padding:10px 14px; flex-wrap:wrap; margin-bottom:6px; }
   .prow-sym { font-weight:bold; font-size:14px; width:110px; flex-shrink:0; }
@@ -655,10 +662,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button id="toggleBtn" onclick="toggleTrading()">...</button>
   </div>
 
+  <div class="bloque">
+    <div class="bloque-header"><div class="bloque-title">Resultado - operaciones cerradas (Scalper + Swing)</div></div>
+    <div class="bloque-sub">No incluye posiciones todavia abiertas ni swaps/comisiones</div>
+    <div class="pnl-grid" id="pnlGrid">
+      <div class="pnl-card"><div class="plabel">Hoy</div><div class="pnet">-</div></div>
+      <div class="pnl-card"><div class="plabel">Esta semana</div><div class="pnet">-</div></div>
+      <div class="pnl-card"><div class="plabel">Este mes</div><div class="pnet">-</div></div>
+    </div>
+  </div>
+
   <div class="two-col">
     <div class="bloque">
       <div class="bloque-header"><div class="bloque-title">Bot Scalper</div></div>
       <div class="bloque-sub">Velas de 5 min - mean reversion RSI</div>
+      <div class="bot-pnl-line" id="scalperPnlLine">Resultado hoy: cargando...</div>
       <h3>Activos</h3>
       <div class="list" id="assetsList"></div>
       <h3>Posiciones abiertas</h3>
@@ -668,6 +686,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="bloque">
       <div class="bloque-header"><div class="bloque-title">Bot Swing</div></div>
       <div class="bloque-sub" id="swingStatus">Cargando...</div>
+      <div class="bot-pnl-line" id="swingPnlLine">Resultado hoy: cargando...</div>
       <h3>Activos</h3>
       <div class="list" id="swingList"></div>
       <h3>Posiciones abiertas</h3>
@@ -887,12 +906,55 @@ async function toggleTrading() {
   fetchFast();
 }
 
+function fmtUsd(n) {
+  const s = (n >= 0 ? '+' : '') + n.toFixed(2);
+  return s;
+}
+
+function pnlCardHtml(label, p) {
+  const cls = p.net_usd >= 0 ? 'pnl-pos' : 'pnl-neg';
+  return '<div class="pnl-card">' +
+    '<div class="plabel">' + label + '</div>' +
+    '<div class="pnet ' + cls + '">' + fmtUsd(p.net_usd) + '</div>' +
+    '<div class="pdetail">' + p.wins + ' ganadas (+' + p.win_usd.toFixed(2) + ') / ' +
+       p.losses + ' perdidas (' + p.loss_usd.toFixed(2) + ')</div>' +
+    '</div>';
+}
+
+function botPnlLineHtml(p) {
+  const cls = p.net_usd >= 0 ? 'pnl-pos' : 'pnl-neg';
+  return 'Hoy: <span class="' + cls + '">' + fmtUsd(p.net_usd) + '</span> (' +
+    p.wins + 'G / ' + p.losses + 'P)';
+}
+
+async function fetchPnl() {
+  try {
+    const res = await fetch('/pnl');
+    const d = await res.json();
+    if (d.error) {
+      document.getElementById('pnlGrid').innerHTML = '<div class="empty">Error trayendo resultados: ' + d.error + '</div>';
+      return;
+    }
+    const grid = document.getElementById('pnlGrid');
+    grid.innerHTML =
+      pnlCardHtml('Hoy', d.combined.today) +
+      pnlCardHtml('Esta semana', d.combined.week) +
+      pnlCardHtml('Este mes', d.combined.month);
+    document.getElementById('scalperPnlLine').innerHTML = botPnlLineHtml(d.scalper.today);
+    document.getElementById('swingPnlLine').innerHTML = botPnlLineHtml(d.swing.today);
+  } catch (e) {
+    document.getElementById('pnlGrid').innerHTML = '<div class="empty">Error consultando resultados.</div>';
+  }
+}
+
 fetchFast();
 fetchSlow();
 fetchSwing();
+fetchPnl();
 setInterval(fetchFast, 5000);
 setInterval(fetchSlow, 20000);
 setInterval(fetchSwing, 30000);
+setInterval(fetchPnl, 60000);
 </script>
 </body>
 </html>
@@ -958,21 +1020,115 @@ def swing_proxy():
     return jsonify({"health": health, "signals": signals, "swing_positions": swing_positions}), 200
 
 
-@app.route("/debug-tx", methods=["GET"])
-def debug_tx():
+def _fetch_month_transactions():
     """
-    v7.9 TEMPORAL: para inspeccionar la forma real de /history/transactions
-    antes de construir el resumen de PnL. Se saca despues de confirmar
-    los nombres de campo correctos.
+    Trae las transacciones del ultimo mes en ventanas de 7 dias (por si
+    la API tiene un limite de rango que no esta documentado - asi no
+    dependemos de pedir 30 dias en una sola llamada).
     """
-    now = datetime.utcnow()
-    from_iso = (now - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
-    to_iso   = now.strftime("%Y-%m-%dT%H:%M:%S")
+    now  = datetime.utcnow()
+    txs  = []
+    seen = set()
+    cursor = now
+    for _ in range(5):  # 5 ventanas de 7 dias = ~35 dias de cobertura
+        start = cursor - timedelta(days=7)
+        try:
+            chunk = client.get_transactions(
+                start.strftime("%Y-%m-%dT%H:%M:%S"),
+                cursor.strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            for t in chunk:
+                ref = t.get("reference")
+                if ref and ref not in seen:
+                    seen.add(ref)
+                    txs.append(t)
+        except Exception as e:
+            logger.warning(f"[pnl] error trayendo ventana {start}-{cursor}: {e}")
+        cursor = start
+    return txs
+
+
+def _summarize(txs, since_dt, epics_filter=None, exclude=False):
+    """
+    epics_filter=None -> sin filtro (todo).
+    epics_filter=set, exclude=False -> solo instrumentos DENTRO del set.
+    epics_filter=set, exclude=True  -> solo instrumentos FUERA del set
+                                        (para derivar el Swing por descarte,
+                                        igual que en /swing-proxy).
+    """
+    wins = losses = 0
+    win_usd = loss_usd = 0.0
+    for t in txs:
+        if t.get("transactionType") != "TRADE":
+            continue
+        if epics_filter is not None:
+            adentro = t.get("instrumentName") in epics_filter
+            if exclude and adentro:
+                continue
+            if not exclude and not adentro:
+                continue
+        try:
+            dt = datetime.fromisoformat(t["dateUtc"].replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if dt < since_dt:
+            continue
+        try:
+            amt = float(t.get("size", 0))
+        except Exception:
+            continue
+        if amt >= 0:
+            wins += 1
+            win_usd += amt
+        else:
+            losses += 1
+            loss_usd += amt
+    return {
+        "wins": wins, "losses": losses,
+        "win_usd": round(win_usd, 2), "loss_usd": round(loss_usd, 2),
+        "net_usd": round(win_usd + loss_usd, 2),
+    }
+
+
+@app.route("/pnl", methods=["GET"])
+def pnl():
+    """
+    v7.9: resumen de ganancias/perdidas de operaciones CERRADAS (dia,
+    semana, mes), separado por bot y combinado. El campo "size" de
+    /history/transactions para type=TRADE es en realidad el PnL
+    realizado de esa operacion (confirmado empiricamente: Crude Oil dio
+    size=96.72, exactamente la ganancia que ya se conocia). No incluye
+    posiciones todavia abiertas (eso ya lo muestra /signals en vivo) ni
+    swaps/comisiones - solo operaciones cerradas.
+    """
+    now = datetime.now(timezone.utc)
+    day_start   = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start  = day_start - timedelta(days=now.weekday())
+    month_start = day_start.replace(day=1)
+
     try:
-        txs = client.get_transactions(from_iso, to_iso)
-        return jsonify({"count": len(txs), "sample": txs[:5], "from": from_iso, "to": to_iso}), 200
+        txs = _fetch_month_transactions()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+    from capital_client import SYMBOL_MAP as SCALPER_SYMBOL_MAP
+    scalper_epics = set(SCALPER_SYMBOL_MAP.values())
+
+    def all_periods(epics_filter=None, exclude=False):
+        return {
+            "today": _summarize(txs, day_start, epics_filter, exclude),
+            "week":  _summarize(txs, week_start, epics_filter, exclude),
+            "month": _summarize(txs, month_start, epics_filter, exclude),
+        }
+
+    return jsonify({
+        "combined": all_periods(None),
+        "scalper":  all_periods(scalper_epics, exclude=False),
+        "swing":    all_periods(scalper_epics, exclude=True),
+        "tx_count": len(txs),
+    }), 200
 
 
 @app.route("/signals", methods=["GET"])
