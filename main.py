@@ -1211,10 +1211,13 @@ def debug_sizing():
     try:
         with scanner_lock:
             sig = dict(scanner_state.get(sym, {}))
-        if not sig:
-            return jsonify({"error": f"sin señal en memoria para {sym}"}), 404
-        entry = sig.get("entry")
-        sl    = sig.get("sl")
+        entry = request.args.get("entry", type=float)
+        sl    = request.args.get("sl", type=float)
+        if entry is None:
+            if not sig:
+                return jsonify({"error": f"sin señal en memoria para {sym}"}), 404
+            entry = sig.get("entry")
+            sl    = sig.get("sl")
         score = 2
         balance = client.get_balance()
         pct = PCT_POR_SCORE.get(min(abs(score), 6), 0.015)
