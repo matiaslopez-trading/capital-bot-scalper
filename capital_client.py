@@ -47,8 +47,10 @@ SYMBOL_MAP = {
     "BNBUSD":  "BNBUSD",
 }
 
-# % del balance a arriesgar por operación (score fijo 2 en v7: muchas
-# operaciones chicas, no pocas operaciones grandes)
+# DEPRECADO desde v7.13 - el sizing por % de riesgo fue reemplazado por el
+# sizing basado en stop garantizado (ver GUARANTEED_STOP_PCT mas abajo).
+# Se deja definido por si algo externo todavia lo importa, pero
+# open_position() ya no lo usa.
 PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 
 # v7.3d: exposicion (notional) maxima permitida por operacion, como % del
@@ -89,6 +91,52 @@ MIN_SIZE = {
     "XLMUSD":   10.0,
     "BNBUSD":   0.01,
 }
+
+# v7.13: distancia minima de stop GARANTIZADO por activo, como % del precio
+# de entrada. Verificada en vivo contra la API real (varia muchisimo entre
+# activos: 0.1% en US100/GBPJPY hasta 75% en ATOMUSD/BNBUSD). Determina el
+# tope de perdida REAL y GARANTIZADO por operacion - a diferencia del SL
+# nativo comun (que puede sufrir slippage en movimientos rapidos), un stop
+# garantizado de Capital.com ejecuta EXACTO al precio pactado sin importar
+# gaps. Reemplaza el SL basado en ATR (que, combinado con el guardrail de
+# exposicion, produjo perdidas de hasta -$12 en vez de los $2 pactados
+# el 21/07/2026 - ver MEMORIA_PROYECTO.md).
+GUARANTEED_STOP_PCT = {
+    "US100":    0.1,
+    "GBPJPY":   0.1,
+    "DOGEUSD":  2.0,
+    "XRPUSD":   0.5,
+    "SOLUSD":   2.0,
+    "AMZN":     7.5,
+    "TSLA":     20.0,
+    "AAPL":     7.5,
+    "MSFT":     7.5,
+    "ADAUSD":   2.0,
+    "LTCUSD":   0.5,
+    "LINKUSD":  2.0,
+    "DOTUSD":   2.0,
+    "AVAXUSD":  2.0,
+    "MATICUSD": 2.0,
+    "ATOMUSD":  75.0,
+    "XLMUSD":   2.0,
+    "BNBUSD":   75.0,
+}
+
+# v7.13: capital de referencia FIJO para el sizing del Scalper - a proposito
+# NO es el balance real de la cuenta demo (~$20.000). Matias pidio que todo
+# el sizing se calcule como si el capital fuera el que va a usar cuando pase
+# a plata real (~$1000), para que el riesgo por operacion sea realista desde
+# ya y no dependa de que la demo tenga de casualidad un balance mucho mayor.
+EFFECTIVE_BALANCE = 1000.0
+
+# v7.3/v7.13: techo de PnL en dolares objetivo por operacion del Scalper.
+# Con el stop garantizado, el tope REAL de perdida varia por activo (ver
+# GUARANTEED_STOP_PCT + MIN_SIZE + MAX_EXPOSURE_PCT) - este valor es el
+# objetivo que persigue el sizing, no una promesa exacta para todos los
+# activos (algunos, como TSLA o BNBUSD, no pueden bajar de ~$4-8 por como
+# esta armado el minimo de la plataforma - queda documentado, no oculto).
+FIXED_TP_USD = 2.0
+FIXED_SL_USD = 2.0
 
 
 class CapitalClient:
@@ -197,57 +245,92 @@ class CapitalClient:
         v7: ya NO bloquea automáticamente si hay una posición abierta en el
         mismo símbolo — el límite de 2 posiciones simultáneas lo controla
         main.py antes de llamar a esta función.
+
+        v7.13: reescrito de raíz. Antes el tamaño se calculaba por % de
+        riesgo sobre el balance real (~$20.000 en la demo) y el SL/TP nativo
+        usaba la distancia del ATR — una combinación que, con posiciones
+        grandes, dejaba que el SL/TP nativo (no garantizado) sufriera
+        slippage: el 21/07/2026 esto produjo pérdidas de hasta -$12 en vez
+        de los $2 pactados. Ahora:
+          1. El tamaño se calcula con un capital de referencia FIJO
+             (EFFECTIVE_BALANCE=$1000, no el balance real de la demo).
+          2. El SL es un STOP GARANTIZADO de Capital.com — ejecuta EXACTO
+             al precio pactado, sin importar gaps o velocidad del mercado.
+          3. La distancia de ese stop está fijada por la plataforma (varía
+             por activo, GUARANTEED_STOP_PCT) — el tamaño se elige para que
+             esa distancia equivalga a FIXED_SL_USD en dólares. Si el
+             tamaño mínimo de la plataforma o el guardrail de exposición
+             no lo permiten, el tope real puede quedar por encima de
+             FIXED_SL_USD (ej. TSLA ronda ~$7-8) — pero SIEMPRE conocido
+             de antemano, nunca una sorpresa como antes.
+          4. El TP usa la MISMA distancia que el SL (R:R 1:1 simétrico,
+             "gana X pierde X" como pidió Matias) como orden límite normal
+             (no necesita ser garantizada, no hay riesgo de slippage
+             ejecutando a favor).
         """
         epic = SYMBOL_MAP.get(symbol)
         if not epic:
             logger.warning(f"[client] Simbolo desconocido: {symbol}")
             return None
+        if entry <= 0:
+            logger.warning(f"[client] {symbol}: entry invalido ({entry})")
+            return None
 
         direction = "BUY" if action == "LONG" else "SELL"
+        min_size  = MIN_SIZE.get(epic, 1.0)
+        gstop_pct = GUARANTEED_STOP_PCT.get(epic, 5.0)  # 5% fallback conservador
 
-        # Sizing: arriesgar risk_usd exactos sobre la distancia al SL
-        pct      = PCT_POR_SCORE.get(min(abs(score), 6), 0.015) * sizing_mult
-        balance  = self.get_balance()
-        risk_usd = balance * pct
-        sl_dist  = abs(entry - sl) if sl and sl != entry else 0
-        if sl_dist > 0:
-            size = round(risk_usd / sl_dist, 4)
-        else:
-            size = round(risk_usd / entry, 4) if entry > 0 else MIN_SIZE.get(epic, 1.0)
-        # Cap: no más del 10% del balance en margen por posición individual.
-        # v7.10.1 fix: antes era 15%, pero eso chocaba directo contra el
-        # guardrail de exposicion maxima (MAX_EXPOSURE_PCT=10%, ver abajo) -
-        # cada vez que este cap era el que mandaba (SL ajustado, tipico en
-        # scalping), la exposicion resultante quedaba fija en 15% del
-        # balance, que SIEMPRE supera el limite del 10% del guardrail y
-        # aborta la operacion. Confirmado en vivo (TSLA, 21/07/2026): un
-        # short valido con ATR ajustado se calculaba en 8.06 acciones
-        # ($3018 de exposicion, 15% de $20.121) y el guardrail lo rechazaba
-        # porque el limite es $2012 (10%). Bajar este cap a 10% hace que
-        # ambos limites sean consistentes: el guardrail solo actua para su
-        # proposito original (tamaño minimo de la plataforma
-        # desproporcionado), no como un choque estructural contra el
-        # sizing normal.
-        if entry > 0:
-            size = min(size, round((balance * MAX_EXPOSURE_PCT) / entry, 4))
-        size = max(size, MIN_SIZE.get(epic, 1.0))
+        # Distancia de precio que exige el stop garantizado para este activo.
+        guar_dist_price = entry * (gstop_pct / 100.0)
+        if guar_dist_price <= 0:
+            logger.warning(f"[client] {symbol}: distancia de stop garantizado invalida")
+            return None
 
-        # v7.3d: guardrail de exposicion maxima. El paso anterior puede
-        # haber forzado size hacia arriba (MIN_SIZE de la plataforma) por
-        # encima del cap de 15% recien aplicado. Si la exposicion final
-        # (size x precio) supera MAX_EXPOSURE_PCT del balance, se aborta
-        # en vez de abrir una posicion desproporcionada para la cuenta.
-        exposure = size * entry if entry > 0 else 0
-        max_exposure = balance * MAX_EXPOSURE_PCT
-        if exposure > max_exposure:
+        # Tamaño objetivo: el que hace que esa distancia equivalga a
+        # FIXED_SL_USD en dolares.
+        target_size = FIXED_SL_USD / guar_dist_price
+
+        # Piso: no menos del minimo de la plataforma.
+        size = max(target_size, min_size)
+
+        # Techo: no mas del guardrail de exposicion, sobre el capital de
+        # referencia fijo (no el balance real de la demo).
+        max_exposure = EFFECTIVE_BALANCE * MAX_EXPOSURE_PCT
+        size_cap     = max_exposure / entry
+        size         = min(size, size_cap)
+        size         = round(size, 4)
+
+        if size < min_size:
+            # El guardrail de exposicion (10% de $1000) no alcanza ni para
+            # el tamaño minimo que exige la plataforma en este activo -
+            # no es operable con este capital de referencia.
             logger.warning(
-                f"[client] {symbol}: operacion abortada - tamaño mínimo de la "
-                f"plataforma ({size}) implica exposición ${exposure:.2f}, "
-                f"por encima del {MAX_EXPOSURE_PCT*100:.0f}% del balance "
-                f"(${max_exposure:.2f} con balance=${balance:.2f}). "
-                f"Activo no operable con este capital."
+                f"[client] {symbol}: operacion abortada - el minimo de la "
+                f"plataforma ({min_size}) implica exposicion "
+                f"${min_size*entry:.2f}, por encima del {MAX_EXPOSURE_PCT*100:.0f}% "
+                f"del capital de referencia (${max_exposure:.2f} sobre "
+                f"${EFFECTIVE_BALANCE:.0f}). Activo no operable con este capital."
             )
             return None
+
+        # Perdida/ganancia REAL que va a resultar si se toca el stop/TP,
+        # dado el tamaño final (puede ser distinto de FIXED_SL_USD si el
+        # minimo de la plataforma o el guardrail de exposicion mandaron).
+        real_usd_at_stop = round(size * guar_dist_price, 2)
+
+        if direction == "BUY":
+            sl_final = round(entry - guar_dist_price, 5)
+            tp_final = round(entry + guar_dist_price, 5)
+        else:
+            sl_final = round(entry + guar_dist_price, 5)
+            tp_final = round(entry - guar_dist_price, 5)
+
+        logger.info(
+            f"[client] {symbol}: sizing v7.13 - size={size} "
+            f"(target={target_size:.4f}, min={min_size}, cap={size_cap:.4f}) | "
+            f"stop garantizado @ {gstop_pct}% = {guar_dist_price:.6f} de distancia | "
+            f"real ${real_usd_at_stop} por lado (objetivo ${FIXED_SL_USD})"
+        )
 
         self.ensure_session()
         url  = f"{BASE_URL}/api/v1/positions"
@@ -255,9 +338,9 @@ class CapitalClient:
             "epic":           epic,
             "direction":      direction,
             "size":           size,
-            "guaranteedStop": False,
-            "stopLevel":      round(sl, 5),
-            "profitLevel":    round(tp1, 5),
+            "guaranteedStop": True,
+            "stopLevel":      sl_final,
+            "profitLevel":    tp_final,
         }
         try:
             resp = requests.post(url, json=body, headers=self._headers(), timeout=15)
@@ -294,8 +377,8 @@ class CapitalClient:
         data["dealId"] = deal_id
         logger.info(
             f"[client] {symbol}: {direction} size={size} "
-            f"({pct*100:.1f}% balance={balance:.0f}) sl={sl} tp={tp1} "
-            f"dealId={deal_id} — {data}"
+            f"sl={sl_final} tp={tp_final} real_usd=${real_usd_at_stop} "
+            f"(guaranteedStop=True) dealId={deal_id} — {data}"
         )
         return data
 

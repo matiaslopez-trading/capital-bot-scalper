@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.10
+main.py — Bot Scalper v7.13
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -78,6 +78,30 @@ TSLA que se hubiera abortado. Fix: el tope de sizing ahora usa
 MAX_EXPOSURE_PCT en vez de un 15% hardcodeado, para que ambos limites
 sean siempre consistentes.
 
+v7.11 (21/07/2026): umbral de RSI relajado de 30/70 a 35/65 en
+scanner.py (0 señales en horas con el umbral estricto tras el fix de
+v7.10.1). Confirmacion de vela sigue siendo obligatoria.
+
+v7.12 (21/07/2026): MIN_SIZE corregido en capital_client.py - los 9
+activos originales tenian el tamaño minimo hasta 100x mas grande que
+el real de la plataforma (verificado contra la API real).
+
+v7.13 (21/07/2026): rediseño completo del sizing/SL/TP en
+capital_client.py, tras detectar que las operaciones del 21/07
+perdieron mucho mas de $2 (hasta -$12) por slippage en el SL nativo
+(no garantizado) combinado con posiciones grandes tras el fix de
+v7.10.1. Ahora: (1) el sizing usa un capital de referencia FIJO de
+$1000 (no el balance real de ~$20k de la demo, pensado para cuando
+Matias pase a plata real), (2) el SL es un STOP GARANTIZADO de
+Capital.com (ejecuta exacto, sin slippage, sin importar gaps), (3) el
+TP usa la misma distancia que el SL (R:R 1:1 simetrico, "gana X pierde
+X"). El tope real por operacion varia por activo segun la distancia
+minima de stop garantizado que exige la plataforma
+(GUARANTEED_STOP_PCT) - la mayoria ronda los $2 pactados, algunos como
+TSLA o BNBUSD quedan mas altos (~$4-8) por el minimo de la plataforma,
+pero SIEMPRE conocido de antemano, nunca una sorpresa. Detalle
+completo en MEMORIA_PROYECTO.md.
+
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
 desaciertos. Hasta 2 posiciones simultáneas por activo.
@@ -95,7 +119,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify
-from capital_client import CapitalClient
+from capital_client import CapitalClient, FIXED_TP_USD, FIXED_SL_USD
 from apscheduler.schedulers.background import BackgroundScheduler
 from data_feed import get_all_ohlcv, CAPITAL_EPICS
 from scanner import run_scanner, COOLDOWN_VELAS, TIME_STOP_BARS, MAX_POS_PER_SYM
@@ -117,10 +141,6 @@ client = CapitalClient()
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "")
 COOLDOWN_DURATION = timedelta(minutes=COOLDOWN_VELAS * 5)
 CANDLE_MINUTES    = 5
-
-# v7.3: techo de PnL fijo en dolares por operacion (ver docstring arriba)
-FIXED_TP_USD = 2.0
-FIXED_SL_USD = 2.0
 
 scanner_state  = {}
 scanner_lock   = threading.Lock()
@@ -1207,23 +1227,6 @@ def stats():
         }), 200
     except Exception as e:
         logger.error(f"[stats] Error: {e}\n{traceback.format_exc()}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/debug-market-full", methods=["GET"])
-def debug_market_full():
-    """TEMPORAL — vuelca el JSON completo de un instrumento (margen, etc)."""
-    epic = request.args.get("epic", "TSLA")
-    try:
-        client.ensure_session()
-        import requests as _rq
-        resp = _rq.get(
-            f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
-            headers=client._headers(), timeout=15,
-        )
-        resp.raise_for_status()
-        return jsonify(resp.json()), 200
-    except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
