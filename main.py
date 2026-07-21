@@ -1221,6 +1221,33 @@ def debug_markets():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug-market-detail", methods=["GET"])
+def debug_market_detail():
+    """TEMPORAL (v7.10 prep) - detalle de un epic puntual (minDealSize real)."""
+    epic = request.args.get("epic", "")
+    try:
+        client.ensure_session()
+        import requests as _rq
+        resp = _rq.get(
+            f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
+            headers=client._headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        rules = data.get("dealingRules", {})
+        snap = data.get("snapshot", {})
+        return jsonify({
+            "epic": epic,
+            "minDealSize": rules.get("minDealSize", {}).get("value"),
+            "marketStatus": snap.get("marketStatus"),
+            "bid": snap.get("bid"),
+            "offer": snap.get("offer"),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
