@@ -194,6 +194,19 @@ cooldown_until_lock = threading.Lock()
 trading_enabled      = True
 trading_enabled_lock = threading.Lock()
 
+# v7.17 FIX: evita que dos ejecuciones de run_cycle() corran al mismo
+# tiempo. Se detecto en datos reales (22/07/2026) un cluster de 4
+# posiciones de ADAUSD abiertas simultaneamente (deberian ser maximo 2,
+# MAX_POS_PER_SYM) que se cerraron todas juntas con perdida grande
+# (-$2.77/-$2.82/-$0.50/-$0.50). Causa mas probable: el scheduler
+# programado (cada 1 min) y una llamada manual a GET /scan corriendo en
+# paralelo, cada una viendo "0 o 1 posiciones abiertas" en own_positions
+# ANTES de que la otra terminara de escribir la suya, y las dos abriendo
+# una posicion nueva - saltandose el limite. run_cycle_lock serializa
+# todas las ejecuciones (programadas y manuales) para que esto no pueda
+# volver a pasar.
+run_cycle_lock = threading.Lock()
+
 
 def _now_utc():
     return datetime.now(timezone.utc)
@@ -413,6 +426,18 @@ def _manage_open_positions(positions_api, signals):
 
 
 def run_cycle():
+    global last_scan_time
+
+    if not run_cycle_lock.acquire(blocking=False):
+        logger.warning("[main] Ya hay un ciclo en ejecucion - se omite esta llamada (evita duplicados).")
+        return
+    try:
+        _run_cycle_inner()
+    finally:
+        run_cycle_lock.release()
+
+
+def _run_cycle_inner():
     global last_scan_time
 
     try:
@@ -1276,6 +1301,30 @@ def signals():
         "own_positions":  pos_copy,
         "cooldowns":      cd_copy,
     }), 200
+
+
+@app.route("/debug-spreads", methods=["GET"])
+def debug_spreads():
+    """TEMPORAL — spread (bid/offer) en vivo para los 18 activos, para comparar liquidez."""
+    from capital_client import SYMBOL_MAP
+    client.ensure_session()
+    out = {}
+    for sym, epic in SYMBOL_MAP.items():
+        try:
+            resp = requests.get(
+                f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
+                headers=client._headers(), timeout=10,
+            )
+            resp.raise_for_status()
+            snap = resp.json().get("snapshot", {})
+            bid = snap.get("bid", 0)
+            offer = snap.get("offer", 0)
+            mid = (bid + offer) / 2 if bid and offer else 0
+            spread_pct = ((offer - bid) / mid * 100) if mid else 0
+            out[sym] = {"bid": bid, "offer": offer, "spread_pct": round(spread_pct, 4)}
+        except Exception as e:
+            out[sym] = {"error": str(e)}
+    return jsonify(out), 200
 
 
 @app.route("/scan", methods=["GET"])
