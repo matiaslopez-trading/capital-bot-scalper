@@ -227,6 +227,53 @@ def _manage_open_positions(positions_api, signals):
                 "position": position,
             }
 
+    # v7.16 FIX: reconciliacion en CADA ciclo (no solo al arrancar). Se
+    # detecto en vivo el 22/07/2026 que 2 posiciones reales de XLMUSD
+    # (abiertas por el propio bot, guaranteedStop=true, visibles en
+    # Capital.com) desaparecieron de own_positions sin haberse cerrado -
+    # el dashboard las mostraba como si no existieran. own_positions solo
+    # se reconstruia una vez al arrancar (_reconcile_positions), asi que
+    # cualquier perdida de estado en memoria durante la vida del proceso
+    # (crash parcial, condicion de carrera entre /scan manual y el ciclo
+    # programado, etc.) quedaba sin corregir hasta el proximo redeploy.
+    # Ahora, en cada ciclo, cualquier posicion viva en la API que
+    # corresponda a un simbolo del Scalper y no este en own_positions se
+    # adopta automaticamente - se autocorrige solo, sin esperar un restart.
+    with own_positions_lock:
+        tracked_deal_ids = {
+            e["deal_id"] for entries in own_positions.values() for e in entries
+        }
+    adoptadas = 0
+    for pos in positions_api:
+        position = pos.get("position", {})
+        deal_id  = position.get("dealId")
+        epic     = pos.get("market", {}).get("epic")
+        sym      = epic_to_sym.get(epic)
+        if not sym or not deal_id or deal_id in tracked_deal_ids:
+            continue
+        created_str = position.get("createdDateUTC")
+        try:
+            open_time = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+            if open_time.tzinfo is None:
+                open_time = open_time.replace(tzinfo=timezone.utc)
+        except Exception:
+            open_time = now
+        with own_positions_lock:
+            own_positions.setdefault(sym, []).append({
+                "deal_id":   deal_id,
+                "direction": position.get("direction", "BUY"),
+                "open_time": open_time,
+                "entry":     float(position.get("level", 0) or 0),
+                "be_done":   False,
+            })
+        adoptadas += 1
+        logger.warning(
+            f"[manage] {sym}: posicion huerfana adoptada (deal={deal_id}) - "
+            f"estaba abierta en Capital.com pero no en own_positions."
+        )
+    if adoptadas:
+        logger.warning(f"[manage] {adoptadas} posicion(es) reconciliadas en este ciclo.")
+
     with own_positions_lock:
         own_pos_copy = {s: list(v) for s, v in own_positions.items()}
 
