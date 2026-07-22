@@ -1208,24 +1208,66 @@ def _fetch_month_transactions():
     return txs
 
 
-def _summarize(txs, since_dt, epics_filter=None, exclude=False):
+# v7.20 FIX CRITICO: la clasificacion Scalper/Swing NO puede basarse en
+# "todo lo que no sea del universo ACTUAL del Scalper es del Swing" (asi
+# funcionaba antes) - el dia que el universo del Scalper cambia (v7.19,
+# se sacaron 12 criptos + GBPJPY), las transacciones HISTORICAS de esos
+# simbolos, generadas cuando SI pertenecian al Scalper, quedan mal
+# atribuidas al Swing con caracter retroactivo. Se detecto en vivo:
+# 22 de 24 transacciones "del Swing" del mes eran en realidad criptos
+# (ADAUSD, LTCUSD, AVAXUSD, LINKUSD, MATICUSD, DOTUSD, XLMUSD, XRPUSD) o
+# GBPJPY - simbolos que salieron del Scalper recien hoy - inflando
+# artificialmente la perdida "del Swing" de ese mes.
+# Fix: el Swing SI se identifica por INCLUSION contra su propio universo
+# fijo (11 simbolos, ver capital-bot/capital_client.py SYMBOL_MAP - hay
+# que mantener esta lista sincronizada a mano si el Swing cambia su
+# universo, los repos estan separados a proposito). El Scalper se
+# identifica por inclusion contra la UNION de su universo actual +
+# cualquier simbolo historico que haya tenido (asi versiones futuras que
+# saquen/sumen activos no vuelven a corromper el historico).
+SWING_EPICS_FIJO = {
+    "BTCUSD", "ETHUSD", "NVDA", "NDAQ", "SILVER", "NATURALGAS",
+    "GBPUSD", "GOLD", "OIL_CRUDE", "EURUSD", "US500",
+}
+SCALPER_EPICS_HISTORICOS = {
+    # universo v7.19 actual
+    "US100", "AMZN", "TSLA", "AAPL", "MSFT", "META", "NFLX", "COIN",
+    "JPM", "NATURALGAS", "GOLD", "SILVER", "OIL_CRUDE",
+    # universo v7.10-v7.18 (removido en v7.19, se mantiene aca solo para
+    # clasificar correctamente transacciones historicas, NO para operar)
+    "GBPJPY", "DOGEUSD", "XRPUSD", "SOLUSD", "ADAUSD", "LTCUSD",
+    "LINKUSD", "DOTUSD", "AVAXUSD", "MATICUSD", "ATOMUSD", "XLMUSD",
+    "BNBUSD",
+}
+
+
+def _classify(instrument):
+    """'swing' | 'scalper' | 'unknown'. NATURALGAS/GOLD/SILVER/OIL_CRUDE
+    estan en ambos universos historicos (los dos bots los usaron en algun
+    momento) - estos 4 quedan ambiguos por diseño, se cuentan como
+    'scalper' (su universo actual real) salvo que en el futuro haga falta
+    desambiguar por fecha."""
+    if instrument in SCALPER_EPICS_HISTORICOS:
+        return "scalper"
+    if instrument in SWING_EPICS_FIJO:
+        return "swing"
+    return "unknown"
+
+
+def _summarize(txs, since_dt, bucket=None):
     """
-    epics_filter=None -> sin filtro (todo).
-    epics_filter=set, exclude=False -> solo instrumentos DENTRO del set.
-    epics_filter=set, exclude=True  -> solo instrumentos FUERA del set
-                                        (para derivar el Swing por descarte,
-                                        igual que en /swing-proxy).
+    bucket=None -> sin filtro (todo, "combined").
+    bucket="scalper"|"swing" -> solo transacciones de ese bot, clasificadas
+    por _classify() (inclusion contra universos fijos, no por descarte del
+    universo actual - ver comentario v7.20 arriba).
     """
     wins = losses = 0
     win_usd = loss_usd = 0.0
     for t in txs:
         if t.get("transactionType") != "TRADE":
             continue
-        if epics_filter is not None:
-            adentro = t.get("instrumentName") in epics_filter
-            if exclude and adentro:
-                continue
-            if not exclude and not adentro:
+        if bucket is not None:
+            if _classify(t.get("instrumentName")) != bucket:
                 continue
         try:
             dt = datetime.fromisoformat(t["dateUtc"].replace("Z", "+00:00"))
@@ -1273,40 +1315,36 @@ def pnl():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    from capital_client import SYMBOL_MAP as SCALPER_SYMBOL_MAP
-    scalper_epics = set(SCALPER_SYMBOL_MAP.values())
-
-    def all_periods(epics_filter=None, exclude=False):
+    def all_periods(bucket=None):
         return {
-            "today": _summarize(txs, day_start, epics_filter, exclude),
-            "week":  _summarize(txs, week_start, epics_filter, exclude),
-            "month": _summarize(txs, month_start, epics_filter, exclude),
+            "today": _summarize(txs, day_start, bucket),
+            "week":  _summarize(txs, week_start, bucket),
+            "month": _summarize(txs, month_start, bucket),
         }
 
     return jsonify({
         "combined": all_periods(None),
-        "scalper":  all_periods(scalper_epics, exclude=False),
-        "swing":    all_periods(scalper_epics, exclude=True),
+        "scalper":  all_periods("scalper"),
+        "swing":    all_periods("swing"),
         "tx_count": len(txs),
     }), 200
 
 
 @app.route("/debug-swing-tx", methods=["GET"])
 def debug_swing_tx():
-    """TEMPORAL — detalle de transacciones TRADE del mes atribuidas al
-    Swing (por descarte de epics del Scalper), ordenadas por monto
-    ascendente, para auditar si hay perdidas individuales fuera de lo
-    que el modelo de stop garantizado deberia permitir."""
+    """TEMPORAL — detalle de transacciones TRADE del mes clasificadas
+    'swing' o 'unknown' por _classify(), ordenadas por monto ascendente,
+    para auditar si hay perdidas individuales fuera de lo que el modelo
+    de stop garantizado deberia permitir."""
     now = datetime.now(timezone.utc)
     month_start = now.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
-    from capital_client import SYMBOL_MAP as SCALPER_SYMBOL_MAP
-    scalper_epics = set(SCALPER_SYMBOL_MAP.values())
     txs = _fetch_month_transactions()
     rows = []
     for t in txs:
         if t.get("transactionType") != "TRADE":
             continue
-        if t.get("instrumentName") in scalper_epics:
+        clase = _classify(t.get("instrumentName"))
+        if clase == "scalper":
             continue
         try:
             dt = datetime.fromisoformat(t["dateUtc"].replace("Z", "+00:00"))
@@ -1323,6 +1361,7 @@ def debug_swing_tx():
         rows.append({
             "date": t.get("dateUtc"),
             "instrument": t.get("instrumentName"),
+            "clase": clase,
             "amount": amt,
             "reference": t.get("reference"),
         })
