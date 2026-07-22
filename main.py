@@ -1305,11 +1305,16 @@ def signals():
 
 @app.route("/debug-spreads", methods=["GET"])
 def debug_spreads():
-    """TEMPORAL — spread (bid/offer) en vivo para los 18 activos, para comparar liquidez."""
+    """TEMPORAL — spread (bid/offer) en vivo. Por defecto los 18 activos del
+    Scalper; se pueden sumar epics candidatos con ?extra=EURUSD,USDJPY,..."""
     from capital_client import SYMBOL_MAP
     client.ensure_session()
+    epics_map = dict(SYMBOL_MAP)
+    extra = request.args.get("extra", "")
+    for e in [x.strip() for x in extra.split(",") if x.strip()]:
+        epics_map[e] = e
     out = {}
-    for sym, epic in SYMBOL_MAP.items():
+    for sym, epic in epics_map.items():
         try:
             resp = requests.get(
                 f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
