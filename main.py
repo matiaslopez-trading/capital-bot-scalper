@@ -1321,12 +1321,19 @@ def debug_spreads():
                 headers=client._headers(), timeout=10,
             )
             resp.raise_for_status()
-            snap = resp.json().get("snapshot", {})
+            j = resp.json()
+            snap = j.get("snapshot", {})
+            rules = j.get("dealingRules", {})
             bid = snap.get("bid", 0)
             offer = snap.get("offer", 0)
             mid = (bid + offer) / 2 if bid and offer else 0
             spread_pct = ((offer - bid) / mid * 100) if mid else 0
-            out[sym] = {"bid": bid, "offer": offer, "spread_pct": round(spread_pct, 4)}
+            out[sym] = {
+                "bid": bid, "offer": offer, "spread_pct": round(spread_pct, 4),
+                "minDealSize": rules.get("minDealSize", {}).get("value"),
+                "minSizeIncrement": rules.get("minSizeIncrement", {}).get("value"),
+                "minGuaranteedStopDistance": rules.get("minGuaranteedStopDistance", {}).get("value"),
+            }
         except Exception as e:
             out[sym] = {"error": str(e)}
     return jsonify(out), 200
