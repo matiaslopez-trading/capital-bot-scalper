@@ -1330,45 +1330,6 @@ def pnl():
     }), 200
 
 
-@app.route("/debug-swing-tx", methods=["GET"])
-def debug_swing_tx():
-    """TEMPORAL — detalle de transacciones TRADE del mes clasificadas
-    'swing' o 'unknown' por _classify(), ordenadas por monto ascendente,
-    para auditar si hay perdidas individuales fuera de lo que el modelo
-    de stop garantizado deberia permitir."""
-    now = datetime.now(timezone.utc)
-    month_start = now.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
-    txs = _fetch_month_transactions()
-    rows = []
-    for t in txs:
-        if t.get("transactionType") != "TRADE":
-            continue
-        clase = _classify(t.get("instrumentName"))
-        if clase == "scalper":
-            continue
-        try:
-            dt = datetime.fromisoformat(t["dateUtc"].replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        if dt < month_start:
-            continue
-        try:
-            amt = float(t.get("size", 0))
-        except Exception:
-            continue
-        rows.append({
-            "date": t.get("dateUtc"),
-            "instrument": t.get("instrumentName"),
-            "clase": clase,
-            "amount": amt,
-            "reference": t.get("reference"),
-        })
-    rows.sort(key=lambda r: r["amount"])
-    return jsonify({"count": len(rows), "rows": rows}), 200
-
-
 @app.route("/signals", methods=["GET"])
 def signals():
     with scanner_lock:
