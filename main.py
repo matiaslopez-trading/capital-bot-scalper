@@ -1291,6 +1291,45 @@ def pnl():
     }), 200
 
 
+@app.route("/debug-swing-tx", methods=["GET"])
+def debug_swing_tx():
+    """TEMPORAL — detalle de transacciones TRADE del mes atribuidas al
+    Swing (por descarte de epics del Scalper), ordenadas por monto
+    ascendente, para auditar si hay perdidas individuales fuera de lo
+    que el modelo de stop garantizado deberia permitir."""
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(hour=0, minute=0, second=0, microsecond=0, day=1)
+    from capital_client import SYMBOL_MAP as SCALPER_SYMBOL_MAP
+    scalper_epics = set(SCALPER_SYMBOL_MAP.values())
+    txs = _fetch_month_transactions()
+    rows = []
+    for t in txs:
+        if t.get("transactionType") != "TRADE":
+            continue
+        if t.get("instrumentName") in scalper_epics:
+            continue
+        try:
+            dt = datetime.fromisoformat(t["dateUtc"].replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if dt < month_start:
+            continue
+        try:
+            amt = float(t.get("size", 0))
+        except Exception:
+            continue
+        rows.append({
+            "date": t.get("dateUtc"),
+            "instrument": t.get("instrumentName"),
+            "amount": amt,
+            "reference": t.get("reference"),
+        })
+    rows.sort(key=lambda r: r["amount"])
+    return jsonify({"count": len(rows), "rows": rows}), 200
+
+
 @app.route("/signals", methods=["GET"])
 def signals():
     with scanner_lock:
