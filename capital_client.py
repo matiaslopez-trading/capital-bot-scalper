@@ -20,32 +20,39 @@ logger = logging.getLogger(__name__)
 BASE_URL    = "https://demo-api-capital.backend-capital.com"
 SESSION_TTL = 540
 
-# Activos del Scalper — universo ampliado v7.10 (20 activos, separado del Bot
-# Swing). Se suman 9 criptomonedas nuevas (epics y minDealSize verificados
-# en vivo contra la API de Capital.com vía /debug-markets antes de sumarlas)
-# para (a) generar mas señales de calidad por dia y (b) cubrir las horas
-# "muertas" fuera del horario de NYSE, ya que crypto opera 24/7. Se evito
-# a proposito pisar el universo del Bot Swing (BTCUSD, ETHUSD, etc).
+# v7.19: universo RECONSTRUIDO desde cero con evidencia, tras un dia de
+# resultados mayormente negativos (32% aciertos). Se midio en vivo el
+# spread real (bid/offer) de los 18 activos anteriores via /debug-spreads:
+# TODAS las 12 criptomonedas (ADAUSD, LTCUSD, LINKUSD, DOTUSD, AVAXUSD,
+# MATICUSD, ATOMUSD, XLMUSD, BNBUSD, DOGEUSD, XRPUSD, SOLUSD) mostraron un
+# spread fijo de ~0.5% (hasta 15x mas ancho que acciones/indices/commodities,
+# que rondan 0.01%-0.25%) y coincidieron exactamente con los peores
+# resultados del dia (ADAUSD -$5.72, AVAXUSD -$1.65, LINKUSD -$1.17, todos
+# el 22/07/2026). Tambien se saca GBPJPY (su minDealSize ya excede el tope
+# de exposicion con este capital de referencia - siempre queda abortado).
+#
+# Reemplazo: se verificaron en vivo contra la API real (spread +
+# dealingRules) varios activos nuevos y se sumaron los que ademas de tener
+# buen spread, con el capital de referencia ($1000) y el nuevo tope de
+# exposicion (15%) alcanzan un tamaño real de operacion cercano al rango
+# pedido por Matias (~$2-3): NATGAS, META, NFLX, COIN, JPM. Se suman
+# tambien GOLD/SILVER/USOIL (spread excelente, quedan un poco por debajo
+# de $2 pero cerca, y aportan mas señales por dia) y se mantiene US100
+# (spread excelente, aporta señales aunque su tamaño real quede chico).
 SYMBOL_MAP = {
     "US100":   "US100",
-    "GBPJPY":  "GBPJPY",
-    "DOGEUSD": "DOGEUSD",
-    "XRPUSD":  "XRPUSD",
-    "SOLUSD":  "SOLUSD",
     "AMZN":    "AMZN",
     "TSLA":    "TSLA",
     "AAPL":    "AAPL",
     "MSFT":    "MSFT",
-    # v7.10 — nuevos, todos crypto 24/7
-    "ADAUSD":  "ADAUSD",
-    "LTCUSD":  "LTCUSD",
-    "LINKUSD": "LINKUSD",
-    "DOTUSD":  "DOTUSD",
-    "AVAXUSD": "AVAXUSD",
-    "MATICUSD": "MATICUSD",
-    "ATOMUSD": "ATOMUSD",
-    "XLMUSD":  "XLMUSD",
-    "BNBUSD":  "BNBUSD",
+    "META":    "META",
+    "NFLX":    "NFLX",
+    "COIN":    "COIN",
+    "JPM":     "JPM",
+    "NATGAS":  "NATURALGAS",
+    "GOLD":    "GOLD",
+    "SILVER":  "SILVER",
+    "USOIL":   "OIL_CRUDE",
 }
 
 # DEPRECADO desde v7.13 - el sizing por % de riesgo fue reemplazado por el
@@ -60,100 +67,80 @@ PCT_POR_SCORE = {2: 0.015, 3: 0.03, 4: 0.05, 5: 0.07, 6: 0.10}
 # desproporcionada si el balance es bajo (con $1000, el minimo de US100
 # ya son ~$2800 de exposicion). Si el minimo obligatorio de la plataforma
 # supera este %, la operacion se aborta en vez de forzarla.
-MAX_EXPOSURE_PCT = 0.10
+# v7.19: subido de 0.10 a 0.15. Con el universo nuevo (mas commodities/
+# acciones con guaranteed-stop % chico, ej. GOLD/SILVER/USOIL al 1%-1.5%),
+# el target real de $2 requiere mas exposicion que antes para alcanzarse
+# sin caer en el minimo de la plataforma. Sigue siendo prudente: 15% de
+# $1000 = $150 de exposicion maxima por operacion.
+MAX_EXPOSURE_PCT = 0.15
 
-# Tamaño mínimo Capital.com (minDealSize real, verificado via /debug-market-full).
-# v7.12 FIX: los 9 valores originales (US100...MSFT) estaban mal cargados
-# de antes de esta sesion - eran hasta 100x mas grandes que el minimo real
-# de la plataforma (ej. XRPUSD tenia 100 hardcodeado, el real es 1; DOGEUSD
-# tenia 1000, el real es 10; US100 tenia 0.1, el real es 0.001). Esto
-# forzaba exposicion innecesariamente grande en cada operacion de esos
-# activos y contribuia a que el guardrail de exposicion los abortara mas
-# seguido de lo necesario. Los 9 activos agregados en v7.10 (ADAUSD en
-# adelante) ya estaban verificados correctamente.
+# Tamaño mínimo Capital.com (minDealSize real, verificado via /debug-spreads
+# el 22/07/2026 para los activos nuevos del universo v7.19).
 MIN_SIZE = {
     "US100":   0.001,
-    "GBPJPY":  100.0,
-    "DOGEUSD": 10.0,
-    "XRPUSD":  1.0,
-    "SOLUSD":  0.1,
     "AMZN":    0.1,
     "TSLA":    0.1,
     "AAPL":    0.1,
     "MSFT":    0.01,
-    # v7.10
-    "ADAUSD":   10.0,
-    "LTCUSD":   0.1,
-    "LINKUSD":  1.0,
-    "DOTUSD":   1.0,
-    "AVAXUSD":  0.1,
-    "MATICUSD": 10.0,
-    "ATOMUSD":  1.0,
-    "XLMUSD":   10.0,
-    "BNBUSD":   0.01,
+    # v7.19
+    "META":         0.01,
+    "NFLX":         0.01,
+    "COIN":         0.1,
+    "JPM":          0.1,
+    "NATURALGAS":   10.0,
+    "GOLD":         0.01,
+    "SILVER":       1.0,
+    "OIL_CRUDE":    1.0,
 }
 
 # v7.13: distancia minima de stop GARANTIZADO por activo, como % del precio
-# de entrada. Verificada en vivo contra la API real (varia muchisimo entre
-# activos: 0.1% en US100/GBPJPY hasta 75% en ATOMUSD/BNBUSD). Determina el
-# tope de perdida REAL y GARANTIZADO por operacion - a diferencia del SL
-# nativo comun (que puede sufrir slippage en movimientos rapidos), un stop
+# de entrada. Verificada en vivo contra la API real. Determina el tope de
+# perdida REAL y GARANTIZADO por operacion - a diferencia del SL nativo
+# comun (que puede sufrir slippage en movimientos rapidos), un stop
 # garantizado de Capital.com ejecuta EXACTO al precio pactado sin importar
 # gaps. Reemplaza el SL basado en ATR (que, combinado con el guardrail de
 # exposicion, produjo perdidas de hasta -$12 en vez de los $2 pactados
 # el 21/07/2026 - ver MEMORIA_PROYECTO.md).
 GUARANTEED_STOP_PCT = {
     "US100":    0.1,
-    "GBPJPY":   0.1,
-    "DOGEUSD":  2.0,
-    "XRPUSD":   0.5,
-    "SOLUSD":   2.0,
     "AMZN":     7.5,
     "TSLA":     20.0,
     "AAPL":     7.5,
     "MSFT":     7.5,
-    "ADAUSD":   2.0,
-    "LTCUSD":   0.5,
-    "LINKUSD":  2.0,
-    "DOTUSD":   2.0,
-    "AVAXUSD":  2.0,
-    "MATICUSD": 2.0,
-    "ATOMUSD":  75.0,
-    "XLMUSD":   2.0,
-    "BNBUSD":   75.0,
+    # v7.19
+    "META":         7.5,
+    "NFLX":         7.5,
+    "COIN":         7.5,
+    "JPM":          7.5,
+    "NATURALGAS":   3.0,
+    "GOLD":         1.0,
+    "SILVER":       1.0,
+    "OIL_CRUDE":    1.5,
 }
 
 # v7.14 FIX CRITICO: Capital.com exige que el tamaño de la posición sea un
 # MULTIPLO EXACTO de este incremento por activo (dealingRules.minSizeIncrement).
-# El sizing de v7.13 calculaba un tamaño "objetivo" (FIXED_SL_USD / distancia
-# del stop garantizado) que casi nunca cae justo en un múltiplo válido — para
-# 13 de los 18 activos (ADAUSD, AMZN, ATOMUSD, AVAXUSD, DOGEUSD, DOTUSD,
-# LINKUSD, LTCUSD, MSFT, SOLUSD, US100, XLMUSD, XRPUSD) el tamaño calculado
-# no era múltiplo del incremento exigido, lo que la API de Capital.com
-# rechazaba silenciosamente (400) — la señal parecía valida en el dashboard
-# pero la operación nunca se abría. Verificado en vivo el 21/07/2026 con
-# ATOMUSD (RSI en sobreventa, señal LONG, pero ninguna posición se creaba).
+# El sizing calcula un tamaño "objetivo" (FIXED_SL_USD / distancia del stop
+# garantizado) que casi nunca cae justo en un múltiplo válido — la API de
+# Capital.com lo rechaza silenciosamente (400) si no se redondea antes.
 # Ahora open_position() redondea el tamaño HACIA ARRIBA al múltiplo válido
-# más cercano antes de enviar la orden.
+# más cercano antes de enviar la orden (ver orden critico del chequeo de
+# abort ANTES de este redondeo, no despues - ver v7.14 en MEMORIA_PROYECTO.md).
 MIN_SIZE_INCREMENT = {
     "US100":    0.001,
-    "GBPJPY":   100.0,
-    "DOGEUSD":  1.0,
-    "XRPUSD":   1.0,
-    "SOLUSD":   0.1,
     "AMZN":     0.1,
     "TSLA":     0.1,
     "AAPL":     0.01,
     "MSFT":     0.01,
-    "ADAUSD":   1.0,
-    "LTCUSD":   0.1,
-    "LINKUSD":  1.0,
-    "DOTUSD":   1.0,
-    "AVAXUSD":  0.1,
-    "MATICUSD": 0.1,
-    "ATOMUSD":  1.0,
-    "XLMUSD":   1.0,
-    "BNBUSD":   0.01,
+    # v7.19
+    "META":         0.01,
+    "NFLX":         0.01,
+    "COIN":         0.01,
+    "JPM":          0.01,
+    "NATURALGAS":   0.1,
+    "GOLD":         0.01,
+    "SILVER":       0.1,
+    "OIL_CRUDE":    0.1,
 }
 
 # v7.13: capital de referencia FIJO para el sizing del Scalper - a proposito

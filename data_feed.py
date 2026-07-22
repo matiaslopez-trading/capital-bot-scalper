@@ -14,28 +14,26 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://demo-api-capital.backend-capital.com"
 
-# 18 activos del Bot Scalper (v7.10) — universo separado del Bot Swing (no se
-# pisan). Se sumaron 9 criptos 24/7 para mas señales y cobertura fuera del
-# horario de NYSE.
+# v7.19: universo reconstruido — se sacan las 12 criptomonedas y GBPJPY
+# (spread ~0.5%, 5-15x mas ancho que el resto, correlacionado con las
+# peores perdidas del 22/07/2026 — ver detalle en capital_client.py) y se
+# suman activos verificados en vivo con mejor spread y mejor ajuste al
+# target de $2-3 por operacion. DEBE mantenerse en sync con SYMBOL_MAP de
+# capital_client.py (mismas claves).
 CAPITAL_EPICS = {
     "US100":   "US100",
-    "GBPJPY":  "GBPJPY",
-    "DOGEUSD": "DOGEUSD",
-    "XRPUSD":  "XRPUSD",
-    "SOLUSD":  "SOLUSD",
     "AMZN":    "AMZN",
     "TSLA":    "TSLA",
     "AAPL":    "AAPL",
     "MSFT":    "MSFT",
-    "ADAUSD":  "ADAUSD",
-    "LTCUSD":  "LTCUSD",
-    "LINKUSD": "LINKUSD",
-    "DOTUSD":  "DOTUSD",
-    "AVAXUSD": "AVAXUSD",
-    "MATICUSD": "MATICUSD",
-    "ATOMUSD": "ATOMUSD",
-    "XLMUSD":  "XLMUSD",
-    "BNBUSD":  "BNBUSD",
+    "META":    "META",
+    "NFLX":    "NFLX",
+    "COIN":    "COIN",
+    "JPM":     "JPM",
+    "NATGAS":  "NATURALGAS",
+    "GOLD":    "GOLD",
+    "SILVER":  "SILVER",
+    "USOIL":   "OIL_CRUDE",
 }
 
 
@@ -76,7 +74,7 @@ def _fetch(epic, client, resolution, limit):
 
 def get_all_ohlcv(client):
     """
-    Descarga velas de 5 minutos para los 18 activos del scalper.
+    Descarga velas de 5 minutos para los 13 activos del scalper (v7.19).
     100 velas = ~8.3 horas de historia, suficiente para RSI(14) y ATR(14).
     Retorna: data_5m: { sym: [candles] | None }
     """

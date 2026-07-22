@@ -335,25 +335,30 @@ def _manage_open_positions(positions_api, signals):
             should_exit = False
             exit_reason = ""
 
-            # v7.15 FIX CRITICO: se elimino la salida manual por PnL fijo
-            # (+-FIXED_TP_USD/-FIXED_SL_USD via polling cada 1 min). Motivo:
-            # desde v7.13 el SL real es un STOP GARANTIZADO por activo (sin
-            # slippage), pero su distancia real casi nunca es exactamente
-            # $2 - varia por activo (ej. AMZN ~$3.70, AAPL ~$2.43, MSFT
-            # ~$2.08, ver real_usd_at_stop en capital_client.py). La salida
-            # manual comparaba contra un umbral fijo de $2 para TODOS los
-            # activos, asi que en la mayoria de los casos disparaba ANTES
-            # de que el stop garantizado hiciera su trabajo, y cerraba con
-            # una orden de mercado comun (sin garantia) que sufria el mismo
-            # slippage que el stop garantizado fue diseñado para eliminar.
-            # Confirmado el 21-22/07/2026: perdidas de -$2.14 a -$4.60 en
-            # AMZN/MSFT/AAPL, todas por encima del target, coincidiendo
-            # exactamente con este patron. Ahora el SL/TP los maneja
-            # exclusivamente la plataforma (stop garantizado + limite TP,
-            # ambos sin slippage) - el polling solo se usa para time-stop y
-            # salida por RSI neutral (que son señales de estrategia, no
-            # intentos de proteger un monto fijo).
-            if bars >= TIME_STOP_BARS:
+            # v7.15: se elimino la salida manual por PnL fijo de AMBOS lados
+            # (+-FIXED_TP_USD/-FIXED_SL_USD via polling). El lado de PERDIDA
+            # se saco porque su umbral fijo de $2 era mas angosto que el
+            # stop garantizado real de la mayoria de los activos (que varia,
+            # ej. AMZN ~$3.70) y disparaba ANTES, cerrando con una orden sin
+            # garantia que sufria slippage - eso quedo bien afuera.
+            #
+            # v7.19: Matias reporto haber visto (en una version anterior)
+            # posiciones que llegaron a tener +$4, +$10, +$15 de ganancia NO
+            # REALIZADA y despues volvieron a perdida porque nada las cerro
+            # a tiempo - el stop garantizado/TP nativo estan fijados a una
+            # distancia de precio, no reaccionan a que la ganancia ya toco
+            # el objetivo en dolares y despues retrocede. A diferencia del
+            # lado de perdida, ESTE lado no tiene el problema de slippage:
+            # cerrar con una orden de mercado cuando ya se esta arriba en
+            # ganancia no es "perseguir un precio que se aleja en contra",
+            # es "asegurar algo que ya se tiene". Se reincorpora SOLO el
+            # lado de ganancia: cualquier posicion que llegue a
+            # +FIXED_TP_USD de PnL no realizado se cierra al instante,
+            # aunque el TP/stop garantizado formal este mas lejos.
+            if pnl >= FIXED_TP_USD:
+                should_exit = True
+                exit_reason = f"ganancia asegurada (${pnl:.2f} >= ${FIXED_TP_USD:.2f})"
+            elif bars >= TIME_STOP_BARS:
                 should_exit = True
                 exit_reason = f"time-stop ({bars} velas / {bars*CANDLE_MINUTES}min)"
 
@@ -1301,42 +1306,6 @@ def signals():
         "own_positions":  pos_copy,
         "cooldowns":      cd_copy,
     }), 200
-
-
-@app.route("/debug-spreads", methods=["GET"])
-def debug_spreads():
-    """TEMPORAL — spread (bid/offer) en vivo. Por defecto los 18 activos del
-    Scalper; se pueden sumar epics candidatos con ?extra=EURUSD,USDJPY,..."""
-    from capital_client import SYMBOL_MAP
-    client.ensure_session()
-    epics_map = dict(SYMBOL_MAP)
-    extra = request.args.get("extra", "")
-    for e in [x.strip() for x in extra.split(",") if x.strip()]:
-        epics_map[e] = e
-    out = {}
-    for sym, epic in epics_map.items():
-        try:
-            resp = requests.get(
-                f"https://demo-api-capital.backend-capital.com/api/v1/markets/{epic}",
-                headers=client._headers(), timeout=10,
-            )
-            resp.raise_for_status()
-            j = resp.json()
-            snap = j.get("snapshot", {})
-            rules = j.get("dealingRules", {})
-            bid = snap.get("bid", 0)
-            offer = snap.get("offer", 0)
-            mid = (bid + offer) / 2 if bid and offer else 0
-            spread_pct = ((offer - bid) / mid * 100) if mid else 0
-            out[sym] = {
-                "bid": bid, "offer": offer, "spread_pct": round(spread_pct, 4),
-                "minDealSize": rules.get("minDealSize", {}).get("value"),
-                "minSizeIncrement": rules.get("minSizeIncrement", {}).get("value"),
-                "minGuaranteedStopDistance": rules.get("minGuaranteedStopDistance", {}).get("value"),
-            }
-        except Exception as e:
-            out[sym] = {"error": str(e)}
-    return jsonify(out), 200
 
 
 @app.route("/scan", methods=["GET"])
