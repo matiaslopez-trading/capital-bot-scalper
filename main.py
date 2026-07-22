@@ -1,5 +1,5 @@
 """
-main.py — Bot Scalper v7.13
+main.py — Bot Scalper v7.15
 Flask + APScheduler. Datos y RSI en velas de 5 minutos, pero el ciclo
 de escaneo corre cada 1 minuto — reacciona a la vela de 5min todavía en
 formación en vez de esperar a que cierre. Esto reduce la latencia de
@@ -101,6 +101,37 @@ minima de stop garantizado que exige la plataforma
 TSLA o BNBUSD quedan mas altos (~$4-8) por el minimo de la plataforma,
 pero SIEMPRE conocido de antemano, nunca una sorpresa. Detalle
 completo en MEMORIA_PROYECTO.md.
+
+v7.14 (21/07/2026): fix critico en capital_client.py — Capital.com exige
+que el tamaño de la posicion sea un multiplo EXACTO de
+dealingRules.minSizeIncrement por activo. El sizing de v7.13 calculaba
+un tamaño continuo que en 13 de los 18 activos no caia en un multiplo
+valido (ADAUSD, AMZN, ATOMUSD, AVAXUSD, DOGEUSD, DOTUSD, LINKUSD,
+LTCUSD, MSFT, SOLUSD, US100, XLMUSD, XRPUSD) - la API rechazaba la
+orden (400) en silencio, la señal se veia bien en el dashboard pero la
+posicion nunca se creaba. Detectado con un ejemplo real de ATOMUSD (RSI
+en sobreventa, señal LONG, ninguna posicion abierta). Fix: nuevo dict
+MIN_SIZE_INCREMENT, se redondea el tamaño hacia arriba al multiplo
+valido DESPUES del chequeo de abort por exposicion (el orden importa:
+si se redondeara antes, GBPJPY volveria a ser "operable" a un tamaño
+que representa 2183% de exposicion en vez de quedar correctamente
+descartado).
+
+v7.15 (22/07/2026): fix critico en la gestion de salida — se elimina la
+salida manual por PnL fijo (polling cada 1 min, cerraba con orden de
+mercado comun apenas el PnL cruzaba +-$2). Motivo: desde v7.13 el SL
+real es un stop GARANTIZADO cuya distancia varia por activo (ej. AMZN
+~$3.70, AAPL ~$2.43, MSFT ~$2.08 — casi nunca exactamente $2). La
+salida manual, al comparar contra un umbral fijo de $2 para todos los
+activos, disparaba ANTES que el stop garantizado en la mayoria de los
+casos, y cerraba con una orden sin garantia que sufria el mismo
+slippage que el stop garantizado fue diseñado para eliminar. Confirmado
+en vivo el 21-22/07/2026: perdidas de -$2.14 a -$4.60 en AMZN/MSFT/AAPL
+(Matias las reporto via screenshot de Capital.com), todas por encima
+del target y coincidiendo con este patron. Ahora el SL/TP los maneja
+exclusivamente la plataforma (stop garantizado + limite TP, ambos sin
+slippage). El polling solo se usa para time-stop y salida por RSI
+neutral (señales de estrategia, no intentos de proteger un monto fijo).
 
 Objetivo (mandato del usuario): MUCHAS operaciones de calidad por día.
 No importa long o short — lo que importa es que haya más aciertos que
@@ -244,17 +275,25 @@ def _manage_open_positions(positions_api, signals):
             should_exit = False
             exit_reason = ""
 
-            # v7.3: prioridad maxima - techo de PnL fijo en dolares.
-            # Se chequea primero porque es el criterio de salida principal;
-            # el resto (time-stop, RSI neutral) son fallback para posiciones
-            # que quedan flotando sin tocar ninguno de los dos techos.
-            if pnl >= FIXED_TP_USD:
-                should_exit = True
-                exit_reason = f"TP fijo (${pnl:.2f} >= ${FIXED_TP_USD:.2f})"
-            elif pnl <= -FIXED_SL_USD:
-                should_exit = True
-                exit_reason = f"SL fijo (${pnl:.2f} <= -${FIXED_SL_USD:.2f})"
-            elif bars >= TIME_STOP_BARS:
+            # v7.15 FIX CRITICO: se elimino la salida manual por PnL fijo
+            # (+-FIXED_TP_USD/-FIXED_SL_USD via polling cada 1 min). Motivo:
+            # desde v7.13 el SL real es un STOP GARANTIZADO por activo (sin
+            # slippage), pero su distancia real casi nunca es exactamente
+            # $2 - varia por activo (ej. AMZN ~$3.70, AAPL ~$2.43, MSFT
+            # ~$2.08, ver real_usd_at_stop en capital_client.py). La salida
+            # manual comparaba contra un umbral fijo de $2 para TODOS los
+            # activos, asi que en la mayoria de los casos disparaba ANTES
+            # de que el stop garantizado hiciera su trabajo, y cerraba con
+            # una orden de mercado comun (sin garantia) que sufria el mismo
+            # slippage que el stop garantizado fue diseñado para eliminar.
+            # Confirmado el 21-22/07/2026: perdidas de -$2.14 a -$4.60 en
+            # AMZN/MSFT/AAPL, todas por encima del target, coincidiendo
+            # exactamente con este patron. Ahora el SL/TP los maneja
+            # exclusivamente la plataforma (stop garantizado + limite TP,
+            # ambos sin slippage) - el polling solo se usa para time-stop y
+            # salida por RSI neutral (que son señales de estrategia, no
+            # intentos de proteger un monto fijo).
+            if bars >= TIME_STOP_BARS:
                 should_exit = True
                 exit_reason = f"time-stop ({bars} velas / {bars*CANDLE_MINUTES}min)"
 
